@@ -49,7 +49,16 @@ EXCLUDED_CUSTOMERS = {
     c.strip().upper()
     for c in os.getenv(
         "EXCLUDED_CUSTOMERS",
-        "Replacements Customer Care Customer Care",
+        "Replacements Customer Care Customer Care,Customer Care Customer Care",
+    ).split(",")
+    if c.strip()
+}
+
+EXCLUDED_CUSTOMER_SUBSTRINGS = {
+    c.strip().upper()
+    for c in os.getenv(
+        "EXCLUDED_CUSTOMER_SUBSTRINGS",
+        "Customer Care Customer Care",
     ).split(",")
     if c.strip()
 }
@@ -396,7 +405,13 @@ def safe_company_name(draft: dict) -> str:
 
 def should_exclude_customer(draft: dict) -> bool:
     customer_name = safe_company_name(draft).strip().upper()
-    return customer_name in EXCLUDED_CUSTOMERS
+    if not customer_name:
+        return False
+
+    if customer_name in EXCLUDED_CUSTOMERS:
+        return True
+
+    return any(fragment in customer_name for fragment in EXCLUDED_CUSTOMER_SUBSTRINGS)
 
 
 def ensure_csv_exists() -> None:
