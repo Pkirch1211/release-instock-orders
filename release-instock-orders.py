@@ -4,6 +4,7 @@ import os
 import re
 import sys
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -58,13 +59,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 DRAFTS_PAGE_SIZE = int(os.getenv("DRAFTS_PAGE_SIZE", "25").strip())
 
 CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip()
+FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
+DEFAULT_FREIGHT_TITLE = os.getenv("DEFAULT_FREIGHT_TITLE", "UPS Ground").strip() or "UPS Ground"
 
 PAYMENT_TEMPLATE_MAP: Dict[int, str] = {
     30: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET30", "").strip(),
     45: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET45", "").strip(),
     60: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET60", "").strip(),
     90: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET90", "").strip(),
-    120: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET120", "").strip(),  # this should now be your Fixed template
+    120: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET120", "").strip(),
 }
 
 logging.basicConfig(
@@ -98,6 +101,9 @@ CSV_HEADERS = [
     "existing_terms_before",
     "payment_terms_after",
     "ship_date",
+    "freight_action",
+    "freight_title",
+    "freight_price",
     "final_tags",
     "order_id",
     "order_name",
@@ -129,6 +135,24 @@ query CandidateDrafts(
         note2
         poNumber
         updatedAt
+        currencyCode
+        subtotalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        shippingLine {
+          id
+          title
+          custom
+          discountedPriceSet {
+            shopMoney {
+              amount
+              currencyCode
+            }
+          }
+        }
         purchasingEntity {
           __typename
           ... on Customer {
@@ -180,6 +204,24 @@ query RecheckDraft(
     tags
     note2
     poNumber
+    currencyCode
+    subtotalPriceSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+    shippingLine {
+      id
+      title
+      custom
+      discountedPriceSet {
+        shopMoney {
+          amount
+          currencyCode
+        }
+      }
+    }
     purchasingEntity {
       __typename
       ... on Customer {
@@ -224,6 +266,17 @@ mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
         dueInDays
         translatedName
         paymentTermsName
+      }
+      shippingLine {
+        id
+        title
+        custom
+        discountedPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
       }
       order {
         id
@@ -362,6 +415,18 @@ def append_csv_log(row: dict) -> None:
         writer.writerow({key: row.get(key, "") for key in CSV_HEADERS})
 
 
+def current_shipping_title(draft: dict) -> str:
+    shipping_line = draft.get("shippingLine") or {}
+    return (shipping_line.get("title") or "").strip()
+
+
+def current_shipping_price(draft: dict) -> str:
+    shipping_line = draft.get("shippingLine") or {}
+    discounted = shipping_line.get("discountedPriceSet") or {}
+    shop_money = discounted.get("shopMoney") or {}
+    return (shop_money.get("amount") or "").strip()
+
+
 def log_draft_result(
     draft: dict,
     *,
@@ -371,6 +436,9 @@ def log_draft_result(
     detected_terms: str = "",
     existing_terms_before: str = "",
     payment_terms_after: str = "",
+    freight_action: str = "",
+    freight_title: str = "",
+    freight_price: str = "",
     order_id: str = "",
     order_name: str = "",
 ) -> None:
@@ -393,6 +461,9 @@ def log_draft_result(
         "existing_terms_before": existing_terms_before,
         "payment_terms_after": payment_terms_after,
         "ship_date": ship_date_value,
+        "freight_action": freight_action,
+        "freight_title": freight_title or current_shipping_title(draft),
+        "freight_price": freight_price or current_shipping_price(draft),
         "final_tags": ",".join(normalize_tags(draft.get("tags", []))),
         "order_id": order_id,
         "order_name": order_name,
@@ -587,6 +658,124 @@ def detect_net_terms_days(text: str) -> Optional[int]:
     return None
 
 
+def parse_decimal(value: Optional[str]) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def money_to_str(amount: Decimal) -> str:
+    return format(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+
+
+def draft_subtotal_amount(draft: dict) -> Optional[Decimal]:
+    subtotal_set = draft.get("subtotalPriceSet") or {}
+    shop_money = subtotal_set.get("shopMoney") or {}
+    return parse_decimal(shop_money.get("amount"))
+
+
+def valid_free_freight_marker_present(text: str) -> bool:
+    if not text:
+        return False
+    patterns = [
+        r"\bFF\b",
+        r"\bF\s*/\s*F\b",
+        r"\bFREE\s+FREIGHT\b",
+        r"\bFREIGHT\s+FREE\b",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def detect_freight_title(text: str) -> str:
+    if not text:
+        return DEFAULT_FREIGHT_TITLE
+
+    if re.search(r"\bUPS\s+GROUND\b", text, flags=re.IGNORECASE):
+        return "UPS Ground"
+    if re.search(r"\b(?:SHIP\s+)?UPS\b", text, flags=re.IGNORECASE):
+        return "UPS"
+    if re.search(r"\b(?:SHIP\s+)?FED\s*EX\b", text, flags=re.IGNORECASE):
+        return "FedEx"
+    if re.search(r"\b(?:SHIP\s+)?FEDEX\b", text, flags=re.IGNORECASE):
+        return "FedEx"
+
+    return DEFAULT_FREIGHT_TITLE
+
+
+def build_freight_quote(draft: dict) -> Tuple[bool, str, str, str]:
+    blob = build_note_blob(draft)
+
+    if valid_free_freight_marker_present(blob):
+        return True, "free-freight", "", ""
+
+    subtotal = draft_subtotal_amount(draft)
+    if subtotal is None:
+        return False, "Could not determine draft subtotal for freight calculation", "", ""
+
+    freight_title = detect_freight_title(blob)
+    freight_amount = (subtotal * FREIGHT_RATE_PERCENT / Decimal("100")).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+    return True, "charge-freight", freight_title, money_to_str(freight_amount)
+
+
+def shipping_line_matches(draft: dict, expected_title: str, expected_price: str) -> bool:
+    shipping_line = draft.get("shippingLine") or {}
+    if not shipping_line:
+        return False
+
+    current_title = (shipping_line.get("title") or "").strip()
+    current_price = parse_decimal(current_shipping_price(draft))
+    desired_price = parse_decimal(expected_price)
+
+    if current_title != expected_title:
+        return False
+    if current_price is None or desired_price is None:
+        return False
+    return current_price == desired_price
+
+
+def ensure_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]:
+    ok, freight_action, freight_title, freight_price = build_freight_quote(draft)
+    if not ok:
+        return False, freight_action, freight_title, freight_price, freight_action
+
+    if freight_action == "free-freight":
+        return True, freight_action, freight_title, freight_price, "Valid free-freight marker found; leaving shipping unchanged"
+
+    if shipping_line_matches(draft, freight_title, freight_price):
+        return True, freight_action, freight_title, freight_price, (
+            f"Existing shipping already matches {freight_title} at {freight_price}"
+        )
+
+    currency_code = (draft.get("currencyCode") or "").strip() or "USD"
+    shipping_payload = {
+        "shippingLine": {
+            "title": freight_title,
+            "priceWithCurrency": {
+                "amount": freight_price,
+                "currencyCode": currency_code,
+            },
+        }
+    }
+
+    logger.info(
+        "Draft %s | setting custom shipping to %s at %s %s",
+        draft["name"],
+        freight_title,
+        freight_price,
+        currency_code,
+    )
+    update_draft(draft["id"], shipping_payload)
+    return True, freight_action, freight_title, freight_price, (
+        f"Set shipping to {freight_title} at {freight_price} {currency_code}"
+    )
+
+
 def build_issued_at(now_dt: datetime) -> str:
     return now_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -612,7 +801,6 @@ def payment_terms_match_detected(payment_terms: Optional[dict], detected_days: O
         return False
 
     if detected_days == 120:
-        # Net 120 is expected to use the Fixed template now.
         if "NET 30" in name or "NET30" in name:
             return False
         if "NET 45" in name or "NET45" in name:
@@ -703,6 +891,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
     draft_id = draft["id"]
     tags = normalize_tags(draft.get("tags", []))
     existing_terms_before = payment_terms_name(draft.get("paymentTerms"))
+    freight_action = ""
+    freight_title = ""
+    freight_price = ""
 
     if not should_process_draft(name):
         logger.info("Skipping %s because it is not in COMPLETE_DRAFT_NAMES", name)
@@ -830,6 +1021,64 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
+    freight_ok, freight_action, freight_title, freight_price, freight_reason = ensure_shipping_logic(latest)
+    logger.info("%s | freight-check=%s | %s", name, freight_ok, freight_reason)
+
+    latest = recheck_draft(draft_id)
+    current_freight_title = current_shipping_title(latest)
+    current_freight_price = current_shipping_price(latest)
+    logger.info(
+        "%s | shipping after update: %s @ %s",
+        name,
+        current_freight_title or "NONE",
+        current_freight_price or "NONE",
+    )
+
+    if not freight_ok:
+        mark_needs_review(latest, freight_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="needs-review",
+            success=False,
+            reason=freight_reason,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
+    if not DRY_RUN and freight_action == "charge-freight":
+        if not shipping_line_matches(latest, freight_title, freight_price):
+            freight_ok = False
+            freight_reason = (
+                f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
+                f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}'"
+            )
+    elif DRY_RUN and freight_action == "charge-freight":
+        logger.info(
+            "%s | DRY RUN active; shipping remains unchanged on recheck because no mutation was sent",
+            name,
+        )
+
+    if not freight_ok:
+        mark_needs_review(latest, freight_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="needs-review",
+            success=False,
+            reason=freight_reason,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
     terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
     logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
 
@@ -868,6 +1117,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             detected_terms=detected_terms,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
         )
         return
 
@@ -899,6 +1151,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             detected_terms=detected_terms,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
             order_id=order_id,
             order_name=order_name,
         )
@@ -911,6 +1166,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             detected_terms=detected_terms,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
             order_id=order_id,
             order_name=order_name,
         )
