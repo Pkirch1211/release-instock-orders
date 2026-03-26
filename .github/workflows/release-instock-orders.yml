@@ -1,0 +1,57 @@
+name: Release In-Stock Draft Orders
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5,35 12-21 * * 1-5"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run release script
+        env:
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+          READY_TAG: ${{ vars.READY_TAG }}
+          PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
+          SUBMITTED_TAG: ${{ vars.SUBMITTED_TAG }}
+          NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
+          SHIP_DATE_NAMESPACE: ${{ vars.SHIP_DATE_NAMESPACE }}
+          SHIP_DATE_KEY: ${{ vars.SHIP_DATE_KEY }}
+          EXCLUDE_TAGS: ${{ vars.EXCLUDE_TAGS }}
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          DRAFTS_PAGE_SIZE: ${{ vars.DRAFTS_PAGE_SIZE }}
+          CSV_LOG_PATH: ${{ vars.CSV_LOG_PATH }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET30: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET30 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET45: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET45 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET60: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET60 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET90: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET90 }}
+          PAYMENT_TERMS_TEMPLATE_ID_NET120: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET120 }}
+          COMPLETE_DRAFT_NAMES: ${{ vars.COMPLETE_DRAFT_NAMES }}
+        run: python release_instock_orders.py
+
+      - name: Upload CSV log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-instock-orders-log
+          path: ${{ vars.CSV_LOG_PATH }}
+          if-no-files-found: ignore
