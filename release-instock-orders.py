@@ -1210,6 +1210,10 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
+    logger.info("%s | marking submitted before completion", name)
+    mark_submitted(latest)
+    latest = recheck_draft(draft_id)
+
     logger.info("%s | completing draft", name)
     completed = complete_draft(draft_id)
 
@@ -1225,8 +1229,6 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             order_name or order_id,
         )
 
-    latest = recheck_draft(draft_id)
-    mark_submitted(latest)
     latest = recheck_draft(draft_id)
 
     if DRY_RUN:
