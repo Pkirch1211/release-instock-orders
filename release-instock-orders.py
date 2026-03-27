@@ -1210,9 +1210,24 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
+    # -----------------------------------------------------------------------
+    # FIX: Mark submitted and verify PROCESSING_TAG is gone before completing.
+    # Shopify stamps the draft's tags onto the created order at completion
+    # time, so we must confirm the tag is absent on a fresh recheck rather
+    # than assuming the update propagated in time.
+    # -----------------------------------------------------------------------
     logger.info("%s | marking submitted before completion", name)
     mark_submitted(latest)
     latest = recheck_draft(draft_id)
+
+    if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
+        logger.warning(
+            "%s | PROCESSING_TAG still present after mark_submitted recheck; forcing removal before complete",
+            name,
+        )
+        clean_tags = remove_tags(normalize_tags(latest.get("tags", [])), PROCESSING_TAG)
+        update_draft(draft_id, {"tags": clean_tags})
+        latest = recheck_draft(draft_id)
 
     logger.info("%s | completing draft", name)
     completed = complete_draft(draft_id)
