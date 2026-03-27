@@ -71,8 +71,13 @@ CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
 DEFAULT_FREIGHT_TITLE = os.getenv("DEFAULT_FREIGHT_TITLE", "UPS Ground").strip() or "UPS Ground"
 
+DEFAULT_PAYMENT_TERMS_TEMPLATE_ID = os.getenv(
+    "DEFAULT_PAYMENT_TERMS_TEMPLATE_ID",
+    "gid://shopify/PaymentTermsTemplate/4",
+).strip()
+
 PAYMENT_TEMPLATE_MAP: Dict[int, str] = {
-    30: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET30", "").strip(),
+    30: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET30", "").strip() or DEFAULT_PAYMENT_TERMS_TEMPLATE_ID,
     45: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET45", "").strip(),
     60: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET60", "").strip(),
     90: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET90", "").strip(),
@@ -816,14 +821,8 @@ def payment_terms_match_detected(payment_terms: Optional[dict], detected_days: O
         return False
 
     if detected_days == 120:
-        if "NET 30" in name or "NET30" in name:
-            return False
-        if "NET 45" in name or "NET45" in name:
-            return False
-        if "NET 60" in name or "NET60" in name:
-            return False
-        if "NET 90" in name or "NET90" in name:
-            return False
+        if "NET 120" in name or "NET120" in name:
+            return True
         if "FIXED" in name:
             return True
         if due_in_days == 120:
@@ -833,71 +832,144 @@ def payment_terms_match_detected(payment_terms: Optional[dict], detected_days: O
     return False
 
 
+def is_issue_date_fixed_terms_error(exc: Exception) -> bool:
+    return "issue date cannot be set with event or fixed payment terms" in str(exc).lower()
+
+
+def try_update_payment_terms_payloads(
+    draft: dict,
+    payloads: List[Tuple[dict, str]],
+) -> Tuple[bool, str]:
+    last_exc: Optional[Exception] = None
+
+    for payload, description in payloads:
+        try:
+            logger.info("Draft %s | attempting payment terms update: %s", draft["name"], description)
+            update_draft(draft["id"], payload)
+            return True, description
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Draft %s | payment terms update attempt failed (%s): %s",
+                draft["name"],
+                description,
+                exc,
+            )
+
+            if is_issue_date_fixed_terms_error(exc):
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+
+    return False, "No payment terms payloads were attempted"
+
+
 def ensure_payment_terms(draft: dict, now_dt: datetime) -> Tuple[bool, str, str, Optional[int]]:
     existing = draft.get("paymentTerms")
     existing_name = payment_terms_name(existing)
 
     blob = build_note_blob(draft)
     detected_days = detect_net_terms_days(blob)
-    detected_label = f"Net {detected_days}" if detected_days else ""
 
-    if not detected_days:
-        if existing:
-            return True, f"No recognizable payment terms found in note/PO; keeping existing terms ({existing_name})", detected_label, detected_days
-        return False, "No payment terms on draft and no recognizable net terms found in note/PO", detected_label, detected_days
+    if detected_days:
+        detected_label = f"Net {detected_days}"
+    else:
+        detected_days = 30
+        detected_label = "Net 30 (defaulted)"
 
     template_id = PAYMENT_TEMPLATE_MAP.get(detected_days, "").strip()
     if not template_id:
-        return False, f"Detected Net {detected_days}, but no template ID is configured", detected_label, detected_days
+        logger.warning(
+            "Draft %s | detected Net %s but no template ID configured; defaulting to Net 30 template %s",
+            draft["name"],
+            detected_days,
+            DEFAULT_PAYMENT_TERMS_TEMPLATE_ID,
+        )
+        detected_days = 30
+        detected_label = "Net 30 (defaulted)"
+        template_id = DEFAULT_PAYMENT_TERMS_TEMPLATE_ID
 
     issued_at = build_issued_at(now_dt)
 
     if detected_days == 120:
         due_at = build_due_at(120, now_dt.date())
-        payment_terms_payload = {
-            "paymentTerms": {
-                "paymentTermsTemplateId": template_id,
-                "paymentSchedules": [
-                    {
-                        "issuedAt": issued_at,
-                        "dueAt": due_at,
+
+        payloads = [
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                        "paymentSchedules": [
+                            {
+                                "dueAt": due_at,
+                            }
+                        ],
                     }
-                ],
-            }
-        }
+                },
+                f"fixed/event-safe update to Net 120 using template {template_id} with dueAt {due_at}",
+            ),
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                    }
+                },
+                f"template-only fallback to Net 120 using template {template_id}",
+            ),
+        ]
+
         logger.info(
-            "Draft %s | overriding existing payment terms '%s' from note/PO to Net 120 using FIXED template %s with issuedAt %s and dueAt %s",
+            "Draft %s | overriding existing payment terms '%s' from note/PO to Net 120 using fixed-safe logic and template %s",
             draft["name"],
             existing_name or "NONE",
             template_id,
-            issued_at,
-            due_at,
         )
-        update_draft(draft["id"], payment_terms_payload)
-        return True, f"Overrode payment terms to Net 120 with issue date {issued_at} and due date {due_at}", detected_label, detected_days
 
-    payment_terms_payload = {
-        "paymentTerms": {
-            "paymentTermsTemplateId": template_id,
-            "paymentSchedules": [
-                {
-                    "issuedAt": issued_at,
+        ok, attempt_description = try_update_payment_terms_payloads(draft, payloads)
+        if not ok:
+            return False, "Failed to update payment terms to Net 120", detected_label, detected_days
+
+        return True, f"Overrode payment terms to Net 120 ({attempt_description})", detected_label, detected_days
+
+    payloads = [
+        (
+            {
+                "paymentTerms": {
+                    "paymentTermsTemplateId": template_id,
+                    "paymentSchedules": [
+                        {
+                            "issuedAt": issued_at,
+                        }
+                    ],
                 }
-            ],
-        }
-    }
+            },
+            f"standard update to Net {detected_days} using template {template_id} with issuedAt {issued_at}",
+        ),
+        (
+            {
+                "paymentTerms": {
+                    "paymentTermsTemplateId": template_id,
+                }
+            },
+            f"template-only fallback to Net {detected_days} using template {template_id}",
+        ),
+    ]
 
     logger.info(
-        "Draft %s | overriding existing payment terms '%s' from note/PO to Net %s using template %s with issuedAt %s",
+        "Draft %s | overriding existing payment terms '%s' to %s using template %s",
         draft["name"],
         existing_name or "NONE",
-        detected_days,
+        detected_label,
         template_id,
-        issued_at,
     )
 
-    update_draft(draft["id"], payment_terms_payload)
-    return True, f"Overrode payment terms to Net {detected_days} with issue date {issued_at}", detected_label, detected_days
+    ok, attempt_description = try_update_payment_terms_payloads(draft, payloads)
+    if not ok:
+        return False, f"Failed to update payment terms to {detected_label}", detected_label, detected_days
+
+    return True, f"Overrode payment terms to {detected_label} ({attempt_description})", detected_label, detected_days
 
 
 def process_draft(draft: dict, now_dt: datetime) -> None:
@@ -1108,11 +1180,11 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
     if not DRY_RUN and detected_terms:
         if not payment_terms_after:
             terms_ok = False
-            terms_reason = f"Detected {detected_terms} in note/PO but payment terms still blank after update"
+            terms_reason = f"Detected {detected_terms} but payment terms are still blank after update"
         elif not payment_terms_match_detected(latest.get("paymentTerms"), detected_days):
             terms_ok = False
             terms_reason = (
-                f"Detected {detected_terms} in note/PO but Shopify returned "
+                f"Detected {detected_terms} but Shopify returned "
                 f"'{payment_terms_after}' after update"
             )
     elif DRY_RUN and detected_terms and not payment_terms_after:
