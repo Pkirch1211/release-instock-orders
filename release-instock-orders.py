@@ -706,8 +706,9 @@ def valid_free_freight_marker_present(text: str) -> bool:
         r"\bF\s*/\s*F\b",
         r"\bFREE\s+FREIGHT\b",
         r"\bFREIGHT\s+FREE\b",
+        r"\bSHIP\s+(?:FED\s*EX|FEDEX|UPS|DHL|USPS)\s+\w+(?:\s+\w+)?\s+ACCOUNT\s+\d+",
     ]
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
 
 
 def detect_freight_title(text: str) -> str:
