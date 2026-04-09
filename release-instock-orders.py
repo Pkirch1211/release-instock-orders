@@ -305,9 +305,11 @@ mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
 }
 """
 
+# paymentPending is deprecated but still functional; pass false for $0 free orders
+# so Shopify treats it as "Mark as paid" (no payment required).
 DRAFT_COMPLETE_MUTATION = """
-mutation CompleteDraftOrder($id: ID!) {
-  draftOrderComplete(id: $id) {
+mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean) {
+  draftOrderComplete(id: $id, paymentPending: $paymentPending) {
     draftOrder {
       id
       name
@@ -549,14 +551,31 @@ def update_draft(draft_id: str, input_payload: dict) -> dict:
     return data["draftOrderUpdate"]["draftOrder"]
 
 
-def complete_draft(draft_id: str) -> dict:
+def complete_draft(draft_id: str, payment_pending: bool = True) -> dict:
+    """Complete a draft order.
+
+    For standard orders, payment_pending=True (default) leaves the order in
+    a payment-pending state consistent with the configured payment terms.
+
+    For $0.00 / free orders, pass payment_pending=False. This is equivalent
+    to clicking 'Mark as paid → Create order' in the Shopify UI, which tells
+    Shopify no payment is required and avoids the 'Payment due later' checkbox
+    issue that prevents normal completion of zero-value drafts.
+
+    Note: the paymentPending argument is deprecated in the Shopify GraphQL API
+    but remains functional. Monitor release notes for a replacement.
+    """
     if DRY_RUN:
-        logger.info("DRY RUN | would complete draft %s", draft_id)
+        logger.info(
+            "DRY RUN | would complete draft %s (paymentPending=%s)",
+            draft_id,
+            payment_pending,
+        )
         return {}
 
     data = shopify_graphql(
         DRAFT_COMPLETE_MUTATION,
-        {"id": draft_id},
+        {"id": draft_id, "paymentPending": payment_pending},
     )
     user_errors = data["draftOrderComplete"].get("userErrors", [])
     if user_errors:
@@ -1231,8 +1250,24 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         update_draft(draft_id, {"tags": clean_tags})
         latest = recheck_draft(draft_id)
 
+    # -----------------------------------------------------------------------
+    # FIX: $0.00 free orders cannot be completed via the normal payment-pending
+    # path — the "Payment due later" checkbox is greyed out in Shopify for
+    # zero-value drafts. Pass paymentPending=False instead, which is equivalent
+    # to clicking "Mark as paid → Create order" and tells Shopify no payment
+    # is required.
+    # -----------------------------------------------------------------------
+    subtotal = draft_subtotal_amount(latest)
+    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
+
+    if is_free_order:
+        logger.info(
+            "%s | subtotal is $0.00; completing as free order (paymentPending=False)",
+            name,
+        )
+
     logger.info("%s | completing draft", name)
-    completed = complete_draft(draft_id)
+    completed = complete_draft(draft_id, payment_pending=not is_free_order)
 
     order_id = ""
     order_name = ""
@@ -1253,7 +1288,7 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             latest,
             action="dry-run-complete",
             success=True,
-            reason="Draft would have been completed",
+            reason="Draft would have been completed" + (" (free order)" if is_free_order else ""),
             detected_terms=detected_terms,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
@@ -1268,7 +1303,7 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             latest,
             action="completed",
             success=True,
-            reason="Draft completed successfully",
+            reason="Draft completed successfully" + (" (free order)" if is_free_order else ""),
             detected_terms=detected_terms,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
