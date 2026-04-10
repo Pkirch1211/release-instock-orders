@@ -87,6 +87,10 @@ PAYMENT_TEMPLATE_MAP: Dict[int, str] = {
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("mt_shopify_sync.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -558,7 +562,7 @@ def complete_draft(draft_id: str, payment_pending: bool = True) -> dict:
     a payment-pending state consistent with the configured payment terms.
 
     For $0.00 / free orders, pass payment_pending=False. This is equivalent
-    to clicking 'Mark as paid → Create order' in the Shopify UI, which tells
+    to clicking 'Mark as paid -> Create order' in the Shopify UI, which tells
     Shopify no payment is required and avoids the 'Payment due later' checkbox
     issue that prevents normal completion of zero-value drafts.
 
@@ -1187,7 +1191,46 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
-    terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
+    # -----------------------------------------------------------------------
+    # Determine early whether this is a $0 free order so we can gate the
+    # payment terms step. Must happen BEFORE ensure_payment_terms is called.
+    # -----------------------------------------------------------------------
+    subtotal = draft_subtotal_amount(latest)
+    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
+
+    if is_free_order:
+        # Belt and suspenders: hard assert before any mutation
+        assert subtotal == Decimal("0.00"), (
+            f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
+        )
+        logger.info(
+            "%s | confirmed $0.00 order; skipping payment terms and stripping any existing terms",
+            name,
+        )
+        update_draft(draft_id, {"paymentTerms": None})
+        latest = recheck_draft(draft_id)
+        if latest.get("paymentTerms"):
+            mark_needs_review(latest, "Could not strip payment terms from $0 order")
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="needs-review",
+                success=False,
+                reason="Could not strip payment terms from $0 order",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+            )
+            return
+        terms_ok = True
+        terms_reason = "Skipped — $0 free order; payment terms stripped"
+        detected_terms = ""
+        detected_days = None
+    else:
+        terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
+
     logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
 
     latest = recheck_draft(draft_id)
@@ -1252,14 +1295,10 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     # -----------------------------------------------------------------------
     # FIX: $0.00 free orders cannot be completed via the normal payment-pending
-    # path — the "Payment due later" checkbox is greyed out in Shopify for
-    # zero-value drafts. Pass paymentPending=False instead, which is equivalent
-    # to clicking "Mark as paid → Create order" and tells Shopify no payment
-    # is required.
+    # path — Shopify rejects completion if payment terms are present on a
+    # zero-value draft. We strip terms earlier in the flow and complete with
+    # paymentPending=False, which is equivalent to "Mark as paid -> Create order".
     # -----------------------------------------------------------------------
-    subtotal = draft_subtotal_amount(latest)
-    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
-
     if is_free_order:
         logger.info(
             "%s | subtotal is $0.00; completing as free order (paymentPending=False)",
