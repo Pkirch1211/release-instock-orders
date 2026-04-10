@@ -332,12 +332,8 @@ mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
 }
 """
 
-# Used ONLY for $0 free orders.
-# Omits paymentPending entirely from the mutation declaration so Shopify
-# does not apply deferred payment logic. Shopify auto-marks $0 orders as
-# paid on completion. Using DRAFT_COMPLETE_MUTATION with any value of
-# paymentPending triggers "Deferred payments are not allowed" when payment
-# terms exist on the draft.
+# Used ONLY for $0 free orders after payment terms have been stripped.
+# Omits paymentPending entirely from the mutation declaration.
 DRAFT_COMPLETE_MUTATION_FREE = """
 mutation CompleteDraftOrderFree($id: ID!) {
   draftOrderComplete(id: $id) {
@@ -585,30 +581,17 @@ def update_draft(draft_id: str, input_payload: dict) -> dict:
 def complete_draft(draft_id: str, is_free: bool = False) -> dict:
     """Complete a draft order.
 
-    For normal (non-zero) orders: uses DRAFT_COMPLETE_MUTATION with
-    paymentPending=True. This path is stable and unchanged.
-
-    For $0 free orders: uses DRAFT_COMPLETE_MUTATION_FREE which omits
-    the paymentPending argument entirely from the mutation declaration.
-    This is critical — even passing paymentPending=False or paymentPending=None
-    via the standard mutation triggers "Deferred payments are not allowed"
-    when payment terms exist on the draft. The separate mutation string
-    avoids this entirely.
+    Normal orders: uses DRAFT_COMPLETE_MUTATION with paymentPending=True.
+    $0 orders: uses DRAFT_COMPLETE_MUTATION_FREE with no paymentPending argument.
+    Payment terms must already be stripped before calling this for $0 orders.
     """
     if DRY_RUN:
-        logger.info(
-            "DRY RUN | would complete draft %s (is_free=%s)",
-            draft_id,
-            is_free,
-        )
+        logger.info("DRY RUN | would complete draft %s (is_free=%s)", draft_id, is_free)
         return {}
 
     if is_free:
-        # $0 order path — separate mutation with no paymentPending argument
-        assert is_free, f"Safety check: is_free must be True to use free mutation on {draft_id}"
         data = shopify_graphql(DRAFT_COMPLETE_MUTATION_FREE, {"id": draft_id})
     else:
-        # Normal order path — unchanged
         data = shopify_graphql(
             DRAFT_COMPLETE_MUTATION,
             {"id": draft_id, "paymentPending": True},
@@ -618,6 +601,37 @@ def complete_draft(draft_id: str, is_free: bool = False) -> dict:
     if user_errors:
         raise RuntimeError(f"draftOrderComplete userErrors: {user_errors}")
     return data["draftOrderComplete"]["draftOrder"]
+
+
+def strip_payment_terms(draft_id: str, name: str) -> bool:
+    """
+    Strip payment terms from a $0 draft order before completion.
+    Only called for confirmed $0 orders. Returns True if terms are
+    successfully cleared, False if they could not be removed.
+    This function is ONLY called when subtotal == Decimal("0.00").
+    """
+    if DRY_RUN:
+        logger.info("DRY RUN | would strip payment terms from %s", name)
+        return True
+
+    logger.info("%s | stripping payment terms before free order completion", name)
+    try:
+        update_draft(draft_id, {"paymentTerms": None})
+    except Exception as exc:
+        logger.warning("%s | payment terms strip attempt raised: %s", name, exc)
+        # Fall through to recheck — Shopify may have accepted it anyway
+
+    latest = recheck_draft(draft_id)
+    if latest.get("paymentTerms"):
+        logger.warning(
+            "%s | payment terms still present after strip attempt: %s",
+            name,
+            payment_terms_name(latest.get("paymentTerms")),
+        )
+        return False
+
+    logger.info("%s | payment terms successfully stripped", name)
+    return True
 
 
 def claim_draft(draft: dict) -> None:
@@ -1226,8 +1240,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     # -----------------------------------------------------------------------
     # NORMAL PATH (non-zero orders): ensure payment terms as usual.
-    # FREE ORDER PATH ($0 only): skip payment terms entirely.
-    # Gated behind a hard subtotal check — only truly $0 orders take this path.
+    # FREE ORDER PATH ($0 only): skip payment terms step, strip any existing
+    # terms, then complete with the free mutation.
+    # Gated behind a hard subtotal check — ONLY truly $0 orders take this path.
     # -----------------------------------------------------------------------
     subtotal = draft_subtotal_amount(latest)
     is_free_order = subtotal is not None and subtotal == Decimal("0.00")
@@ -1237,11 +1252,32 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
         )
         logger.info("%s | $0.00 order detected; skipping payment terms step", name)
+
+        # Strip any existing payment terms — required for free order completion
+        terms_stripped = strip_payment_terms(draft_id, name)
+        if not terms_stripped:
+            mark_needs_review(latest, "Could not strip payment terms from $0 order")
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="needs-review",
+                success=False,
+                reason="Could not strip payment terms from $0 order",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+            )
+            return
+
+        latest = recheck_draft(draft_id)
         terms_ok = True
-        terms_reason = "Skipped — $0 free order"
+        terms_reason = "Skipped — $0 free order; payment terms stripped"
         detected_terms = ""
         detected_days = None
     else:
+        # Normal path — completely untouched
         terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
 
     logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
@@ -1305,12 +1341,10 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     # -----------------------------------------------------------------------
     # COMPLETION:
-    # Normal orders: complete_draft(is_free=False) — uses DRAFT_COMPLETE_MUTATION
+    # Normal orders: complete_draft(is_free=False) — DRAFT_COMPLETE_MUTATION
     #   with paymentPending=True. Unchanged and stable.
-    # $0 orders: complete_draft(is_free=True) — uses DRAFT_COMPLETE_MUTATION_FREE
-    #   which has no paymentPending argument at all in the mutation declaration.
-    #   This is the only way to avoid "Deferred payments are not allowed" when
-    #   payment terms exist on a $0 draft.
+    # $0 orders: complete_draft(is_free=True) — DRAFT_COMPLETE_MUTATION_FREE
+    #   with no paymentPending argument. Payment terms already stripped above.
     # -----------------------------------------------------------------------
     if is_free_order:
         logger.info("%s | $0.00 order; using free-order completion mutation", name)
