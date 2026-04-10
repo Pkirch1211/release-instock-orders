@@ -309,13 +309,38 @@ mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
 }
 """
 
-# Standard completion mutation — used for ALL orders including $0.
-# For normal orders: paymentPending=True (deferred per payment terms).
-# For $0 orders: paymentPending is omitted entirely (Shopify auto-marks as paid).
-# DO NOT pass paymentPending=False — that triggers "Deferred payments are not allowed".
+# Used for ALL normal (non-zero) orders.
+# paymentPending=True leaves the order in a payment-pending state
+# consistent with the configured payment terms.
+# DO NOT use this mutation for $0 orders.
 DRAFT_COMPLETE_MUTATION = """
-mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean) {
+mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
   draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+    draftOrder {
+      id
+      name
+      order {
+        id
+        name
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+# Used ONLY for $0 free orders.
+# Omits paymentPending entirely from the mutation declaration so Shopify
+# does not apply deferred payment logic. Shopify auto-marks $0 orders as
+# paid on completion. Using DRAFT_COMPLETE_MUTATION with any value of
+# paymentPending triggers "Deferred payments are not allowed" when payment
+# terms exist on the draft.
+DRAFT_COMPLETE_MUTATION_FREE = """
+mutation CompleteDraftOrderFree($id: ID!) {
+  draftOrderComplete(id: $id) {
     draftOrder {
       id
       name
@@ -557,40 +582,38 @@ def update_draft(draft_id: str, input_payload: dict) -> dict:
     return data["draftOrderUpdate"]["draftOrder"]
 
 
-def complete_draft(draft_id: str, payment_pending: bool = True) -> dict:
+def complete_draft(draft_id: str, is_free: bool = False) -> dict:
     """Complete a draft order.
 
-    For normal (non-zero) orders: payment_pending=True (default). This leaves
-    the order in a payment-pending state consistent with the configured payment
-    terms. DO NOT change this path — it is stable and working.
+    For normal (non-zero) orders: uses DRAFT_COMPLETE_MUTATION with
+    paymentPending=True. This path is stable and unchanged.
 
-    For $0.00 free orders: payment_pending is omitted from the mutation entirely
-    by passing None as the variable value. Shopify auto-marks $0 orders as paid
-    on completion without requiring a payment transaction. Passing False instead
-    triggers a "Deferred payments are not allowed" error when payment terms exist.
-
-    Note: the paymentPending argument is deprecated in the Shopify GraphQL API
-    but remains functional. Monitor release notes for a replacement.
+    For $0 free orders: uses DRAFT_COMPLETE_MUTATION_FREE which omits
+    the paymentPending argument entirely from the mutation declaration.
+    This is critical — even passing paymentPending=False or paymentPending=None
+    via the standard mutation triggers "Deferred payments are not allowed"
+    when payment terms exist on the draft. The separate mutation string
+    avoids this entirely.
     """
     if DRY_RUN:
         logger.info(
-            "DRY RUN | would complete draft %s (paymentPending=%s)",
+            "DRY RUN | would complete draft %s (is_free=%s)",
             draft_id,
-            payment_pending,
+            is_free,
         )
         return {}
 
-    # -----------------------------------------------------------------------
-    # IMPORTANT: For $0 orders, omit paymentPending entirely (pass None so the
-    # variable is excluded from the request). Do NOT use paymentPending=False —
-    # that causes "Deferred payments are not allowed" when terms exist.
-    # For all normal orders, paymentPending=True is passed as before.
-    # -----------------------------------------------------------------------
-    variables: dict = {"id": draft_id}
-    if payment_pending is not None:
-        variables["paymentPending"] = payment_pending
+    if is_free:
+        # $0 order path — separate mutation with no paymentPending argument
+        assert is_free, f"Safety check: is_free must be True to use free mutation on {draft_id}"
+        data = shopify_graphql(DRAFT_COMPLETE_MUTATION_FREE, {"id": draft_id})
+    else:
+        # Normal order path — unchanged
+        data = shopify_graphql(
+            DRAFT_COMPLETE_MUTATION,
+            {"id": draft_id, "paymentPending": True},
+        )
 
-    data = shopify_graphql(DRAFT_COMPLETE_MUTATION, variables)
     user_errors = data["draftOrderComplete"].get("userErrors", [])
     if user_errors:
         raise RuntimeError(f"draftOrderComplete userErrors: {user_errors}")
@@ -1203,15 +1226,13 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     # -----------------------------------------------------------------------
     # NORMAL PATH (non-zero orders): ensure payment terms as usual.
-    # FREE ORDER PATH ($0 only): skip payment terms entirely — Shopify does
-    # not allow setting or requiring terms on $0 orders, and the completion
-    # mutation handles them automatically without paymentPending.
+    # FREE ORDER PATH ($0 only): skip payment terms entirely.
+    # Gated behind a hard subtotal check — only truly $0 orders take this path.
     # -----------------------------------------------------------------------
     subtotal = draft_subtotal_amount(latest)
     is_free_order = subtotal is not None and subtotal == Decimal("0.00")
 
     if is_free_order:
-        # Hard safety check — only proceed down this path if truly $0
         assert subtotal == Decimal("0.00"), (
             f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
         )
@@ -1221,7 +1242,6 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         detected_terms = ""
         detected_days = None
     else:
-        # Normal path — untouched
         terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
 
     logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
@@ -1268,7 +1288,7 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         return
 
     # -----------------------------------------------------------------------
-    # FIX: Mark submitted and verify PROCESSING_TAG is gone before completing.
+    # Mark submitted and verify PROCESSING_TAG is gone before completing.
     # -----------------------------------------------------------------------
     logger.info("%s | marking submitted before completion", name)
     mark_submitted(latest)
@@ -1285,18 +1305,17 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     # -----------------------------------------------------------------------
     # COMPLETION:
-    # Normal orders: complete_draft(payment_pending=True) — unchanged, stable.
-    # $0 orders: complete_draft(payment_pending=None) — omits the paymentPending
-    # argument entirely so Shopify auto-handles the $0 completion.
+    # Normal orders: complete_draft(is_free=False) — uses DRAFT_COMPLETE_MUTATION
+    #   with paymentPending=True. Unchanged and stable.
+    # $0 orders: complete_draft(is_free=True) — uses DRAFT_COMPLETE_MUTATION_FREE
+    #   which has no paymentPending argument at all in the mutation declaration.
+    #   This is the only way to avoid "Deferred payments are not allowed" when
+    #   payment terms exist on a $0 draft.
     # -----------------------------------------------------------------------
     if is_free_order:
-        logger.info(
-            "%s | $0.00 order; completing without paymentPending argument",
-            name,
-        )
-        completed = complete_draft(draft_id, payment_pending=None)
-    else:
-        completed = complete_draft(draft_id, payment_pending=True)
+        logger.info("%s | $0.00 order; using free-order completion mutation", name)
+
+    completed = complete_draft(draft_id, is_free=is_free_order)
 
     order_id = ""
     order_name = ""
