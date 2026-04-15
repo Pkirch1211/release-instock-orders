@@ -3,7 +3,7 @@ name: Release In-Stock Draft Orders
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5,35 12-21 * * 1-5"
+    - cron: "5 12-21 * * 1-5"
 
 jobs:
   run:
