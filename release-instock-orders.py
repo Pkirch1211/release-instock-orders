@@ -619,7 +619,6 @@ def strip_payment_terms(draft_id: str, name: str) -> bool:
         update_draft(draft_id, {"paymentTerms": None})
     except Exception as exc:
         logger.warning("%s | payment terms strip attempt raised: %s", name, exc)
-        # Fall through to recheck — Shopify may have accepted it anyway
 
     latest = recheck_draft(draft_id)
     if latest.get("paymentTerms"):
@@ -646,10 +645,20 @@ def release_claim(draft: dict) -> None:
     update_draft(draft["id"], {"tags": released_tags})
 
 
+def clear_submitted_tag(draft: dict) -> None:
+    current_tags = normalize_tags(draft.get("tags", []))
+    cleaned_tags = remove_tags(current_tags, SUBMITTED_TAG)
+    update_draft(draft["id"], {"tags": cleaned_tags})
+
+
 def mark_needs_review(draft: dict, reason: Optional[str] = None) -> None:
     current_tags = normalize_tags(draft.get("tags", []))
     final_tags = add_tags(current_tags, NEEDS_REVIEW_TAG)
-    final_tags = remove_tags(final_tags, PROCESSING_TAG)
+    final_tags = remove_tags(
+        final_tags,
+        PROCESSING_TAG,
+        SUBMITTED_TAG,
+    )
     update_draft(draft["id"], {"tags": final_tags})
     if reason:
         logger.warning("%s | marked %s | %s", draft.get("name"), NEEDS_REVIEW_TAG, reason)
@@ -664,6 +673,31 @@ def mark_submitted(draft: dict) -> None:
         NEEDS_REVIEW_TAG,
     )
     update_draft(draft["id"], {"tags": final_tags})
+
+
+def validate_completion_result(
+    *,
+    name: str,
+    draft_after_complete: dict,
+    completed_payload: dict,
+) -> Tuple[str, str]:
+    payload_order = (completed_payload or {}).get("order") or {}
+    latest_order = (draft_after_complete.get("order") or {})
+
+    order_id = latest_order.get("id") or payload_order.get("id") or ""
+    order_name = latest_order.get("name") or payload_order.get("name") or ""
+
+    if draft_after_complete.get("status") == "OPEN":
+        raise RuntimeError(
+            f"{name} completion mutation returned but draft is still OPEN after recheck"
+        )
+
+    if not order_id:
+        raise RuntimeError(
+            f"{name} completion mutation returned but no Shopify order was attached after recheck"
+        )
+
+    return order_id, order_name
 
 
 def parse_ship_date(raw_value: Optional[str]) -> Optional[date]:
@@ -1238,12 +1272,6 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
-    # -----------------------------------------------------------------------
-    # NORMAL PATH (non-zero orders): ensure payment terms as usual.
-    # FREE ORDER PATH ($0 only): skip payment terms step, strip any existing
-    # terms, then complete with the free mutation.
-    # Gated behind a hard subtotal check — ONLY truly $0 orders take this path.
-    # -----------------------------------------------------------------------
     subtotal = draft_subtotal_amount(latest)
     is_free_order = subtotal is not None and subtotal == Decimal("0.00")
 
@@ -1253,7 +1281,6 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         logger.info("%s | $0.00 order detected; skipping payment terms step", name)
 
-        # Strip any existing payment terms — required for free order completion
         terms_stripped = strip_payment_terms(draft_id, name)
         if not terms_stripped:
             mark_needs_review(latest, "Could not strip payment terms from $0 order")
@@ -1273,11 +1300,10 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
         latest = recheck_draft(draft_id)
         terms_ok = True
-        terms_reason = "Skipped — $0 free order; payment terms stripped"
+        terms_reason = "Skipped - $0 free order; payment terms stripped"
         detected_terms = ""
         detected_days = None
     else:
-        # Normal path — completely untouched
         terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
 
     logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
@@ -1323,29 +1349,15 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         )
         return
 
-    # -----------------------------------------------------------------------
-    # Mark submitted and verify PROCESSING_TAG is gone before completing.
-    # -----------------------------------------------------------------------
-    logger.info("%s | marking submitted before completion", name)
-    mark_submitted(latest)
-    latest = recheck_draft(draft_id)
-
-    if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
+    latest_tags = normalize_tags(latest.get("tags", []))
+    if PROCESSING_TAG not in latest_tags:
         logger.warning(
-            "%s | PROCESSING_TAG still present after mark_submitted recheck; forcing removal before complete",
+            "%s | PROCESSING_TAG missing before completion attempt; re-applying claim",
             name,
         )
-        clean_tags = remove_tags(normalize_tags(latest.get("tags", [])), PROCESSING_TAG)
-        update_draft(draft_id, {"tags": clean_tags})
+        claim_draft(latest)
         latest = recheck_draft(draft_id)
 
-    # -----------------------------------------------------------------------
-    # COMPLETION:
-    # Normal orders: complete_draft(is_free=False) — DRAFT_COMPLETE_MUTATION
-    #   with paymentPending=True. Unchanged and stable.
-    # $0 orders: complete_draft(is_free=True) — DRAFT_COMPLETE_MUTATION_FREE
-    #   with no paymentPending argument. Payment terms already stripped above.
-    # -----------------------------------------------------------------------
     if is_free_order:
         logger.info("%s | $0.00 order; using free-order completion mutation", name)
 
@@ -1353,17 +1365,32 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 
     order_id = ""
     order_name = ""
+    latest = recheck_draft(draft_id)
+
     if not DRY_RUN:
-        order = completed.get("order") or {}
-        order_id = order.get("id", "")
-        order_name = order.get("name", "")
+        order_id, order_name = validate_completion_result(
+            name=name,
+            draft_after_complete=latest,
+            completed_payload=completed,
+        )
         logger.info(
             "%s | completed successfully -> order %s",
             name,
             order_name or order_id,
         )
 
-    latest = recheck_draft(draft_id)
+        mark_submitted(latest)
+        latest = recheck_draft(draft_id)
+
+        if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
+            raise RuntimeError(
+                f"{name} completed but {PROCESSING_TAG} is still present after mark_submitted"
+            )
+
+        if SUBMITTED_TAG not in normalize_tags(latest.get("tags", [])):
+            raise RuntimeError(
+                f"{name} completed but {SUBMITTED_TAG} was not present after final tag update"
+            )
 
     if DRY_RUN:
         log_draft_result(
@@ -1408,8 +1435,14 @@ def main() -> None:
             logger.exception("Failed processing %s: %s", draft.get("name"), exc)
             try:
                 latest = recheck_draft(draft["id"])
+
+                if SUBMITTED_TAG in normalize_tags(latest.get("tags", [])):
+                    clear_submitted_tag(latest)
+                    latest = recheck_draft(draft["id"])
+
                 mark_needs_review(latest, str(exc))
                 latest = recheck_draft(draft["id"])
+
                 log_draft_result(
                     latest,
                     action="needs-review",
@@ -1417,6 +1450,8 @@ def main() -> None:
                     reason=str(exc),
                     existing_terms_before=payment_terms_name(draft.get("paymentTerms")),
                     payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                    order_id=(latest.get("order") or {}).get("id", ""),
+                    order_name=(latest.get("order") or {}).get("name", ""),
                 )
             except Exception:
                 logger.exception("Could not apply needs-review tag to %s", draft.get("name"))
