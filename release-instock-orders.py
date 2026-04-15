@@ -309,10 +309,6 @@ mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
 }
 """
 
-# Used for ALL normal (non-zero) orders.
-# paymentPending=True leaves the order in a payment-pending state
-# consistent with the configured payment terms.
-# DO NOT use this mutation for $0 orders.
 DRAFT_COMPLETE_MUTATION = """
 mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
   draftOrderComplete(id: $id, paymentPending: $paymentPending) {
@@ -332,8 +328,6 @@ mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
 }
 """
 
-# Used ONLY for $0 free orders after payment terms have been stripped.
-# Omits paymentPending entirely from the mutation declaration.
 DRAFT_COMPLETE_MUTATION_FREE = """
 mutation CompleteDraftOrderFree($id: ID!) {
   draftOrderComplete(id: $id) {
@@ -579,12 +573,6 @@ def update_draft(draft_id: str, input_payload: dict) -> dict:
 
 
 def complete_draft(draft_id: str, is_free: bool = False) -> dict:
-    """Complete a draft order.
-
-    Normal orders: uses DRAFT_COMPLETE_MUTATION with paymentPending=True.
-    $0 orders: uses DRAFT_COMPLETE_MUTATION_FREE with no paymentPending argument.
-    Payment terms must already be stripped before calling this for $0 orders.
-    """
     if DRY_RUN:
         logger.info("DRY RUN | would complete draft %s (is_free=%s)", draft_id, is_free)
         return {}
@@ -604,12 +592,6 @@ def complete_draft(draft_id: str, is_free: bool = False) -> dict:
 
 
 def strip_payment_terms(draft_id: str, name: str) -> bool:
-    """
-    Strip payment terms from a $0 draft order before completion.
-    Only called for confirmed $0 orders. Returns True if terms are
-    successfully cleared, False if they could not be removed.
-    This function is ONLY called when subtotal == Decimal("0.00").
-    """
     if DRY_RUN:
         logger.info("DRY RUN | would strip payment terms from %s", name)
         return True
@@ -673,6 +655,16 @@ def mark_submitted(draft: dict) -> None:
         NEEDS_REVIEW_TAG,
     )
     update_draft(draft["id"], {"tags": final_tags})
+
+
+def finalize_non_success_tags(draft: dict) -> None:
+    """
+    Best-effort cleanup for any non-successful path.
+    Removes processing/submitted and preserves everything else.
+    """
+    current_tags = normalize_tags(draft.get("tags", []))
+    cleaned_tags = remove_tags(current_tags, PROCESSING_TAG, SUBMITTED_TAG)
+    update_draft(draft["id"], {"tags": cleaned_tags})
 
 
 def validate_completion_result(
@@ -1088,6 +1080,9 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
     freight_title = ""
     freight_price = ""
 
+    claimed = False
+    completed_successfully = False
+
     if not should_process_draft(name):
         logger.info("Skipping %s because it is not in COMPLETE_DRAFT_NAMES", name)
         return
@@ -1103,193 +1098,148 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
     logger.info("-----")
     logger.info("Evaluating %s", name)
 
-    claim_draft(draft)
+    try:
+        claim_draft(draft)
+        claimed = True
 
-    latest = recheck_draft(draft_id)
-    latest_tags = normalize_tags(latest.get("tags", []))
-
-    if latest.get("order"):
-        logger.info("%s already has an order; marking submitted", name)
-        mark_submitted(latest)
         latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="already-submitted",
-            success=True,
-            reason="Draft already had an order",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            order_id=(latest.get("order") or {}).get("id", ""),
-            order_name=(latest.get("order") or {}).get("name", ""),
-        )
-        return
+        latest_tags = normalize_tags(latest.get("tags", []))
 
-    if latest.get("status") != "OPEN":
-        logger.info("%s is no longer OPEN; releasing claim", name)
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="released-claim",
-            success=False,
-            reason="Draft no longer open",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    if READY_TAG not in latest_tags:
-        logger.info("%s no longer has %s; releasing claim", name, READY_TAG)
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="released-claim",
-            success=False,
-            reason=f"Draft no longer tagged {READY_TAG}",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    if NEEDS_REVIEW_TAG in latest_tags:
-        logger.info("%s now has %s; releasing claim", name, NEEDS_REVIEW_TAG)
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="released-claim",
-            success=False,
-            reason=f"Draft tagged {NEEDS_REVIEW_TAG}",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    if has_excluded_tag(latest_tags):
-        logger.info("%s now has an excluded tag; releasing claim", name)
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="released-claim",
-            success=False,
-            reason="Draft has excluded tag",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    if should_exclude_customer(latest):
-        logger.info("%s now has excluded customer after recheck: %s", name, safe_company_name(latest))
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="skipped",
-            success=False,
-            reason=f"Excluded customer: {safe_company_name(latest)}",
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    ship_date_value = ""
-    if latest.get("metafield"):
-        ship_date_value = latest["metafield"].get("value") or ""
-
-    ship_ok, ship_reason = ship_date_allows_release(ship_date_value, today)
-    logger.info("%s | ship-date-check=%s | %s", name, ship_ok, ship_reason)
-
-    if not ship_ok:
-        release_claim(latest)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="skipped",
-            success=False,
-            reason=ship_reason,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-        )
-        return
-
-    freight_ok, freight_action, freight_title, freight_price, freight_reason = ensure_shipping_logic(latest)
-    logger.info("%s | freight-check=%s | %s", name, freight_ok, freight_reason)
-
-    latest = recheck_draft(draft_id)
-    current_freight_title = current_shipping_title(latest)
-    current_freight_price = current_shipping_price(latest)
-    logger.info(
-        "%s | shipping after update: %s @ %s",
-        name,
-        current_freight_title or "NONE",
-        current_freight_price or "NONE",
-    )
-
-    if not freight_ok:
-        mark_needs_review(latest, freight_reason)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="needs-review",
-            success=False,
-            reason=freight_reason,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            freight_action=freight_action,
-            freight_title=freight_title,
-            freight_price=freight_price,
-        )
-        return
-
-    if not DRY_RUN and freight_action == "charge-freight":
-        if not shipping_line_matches(latest, freight_title, freight_price):
-            freight_ok = False
-            freight_reason = (
-                f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
-                f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}'"
+        if latest.get("order"):
+            logger.info("%s already has an order; marking submitted", name)
+            mark_submitted(latest)
+            latest = recheck_draft(draft_id)
+            completed_successfully = True
+            log_draft_result(
+                latest,
+                action="already-submitted",
+                success=True,
+                reason="Draft already had an order",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                order_id=(latest.get("order") or {}).get("id", ""),
+                order_name=(latest.get("order") or {}).get("name", ""),
             )
-    elif DRY_RUN and freight_action == "charge-freight":
-        logger.info(
-            "%s | DRY RUN active; shipping remains unchanged on recheck because no mutation was sent",
-            name,
-        )
+            return
 
-    if not freight_ok:
-        mark_needs_review(latest, freight_reason)
+        if latest.get("status") != "OPEN":
+            logger.info("%s is no longer OPEN; releasing claim", name)
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="released-claim",
+                success=False,
+                reason="Draft no longer open",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        if READY_TAG not in latest_tags:
+            logger.info("%s no longer has %s; releasing claim", name, READY_TAG)
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="released-claim",
+                success=False,
+                reason=f"Draft no longer tagged {READY_TAG}",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        if NEEDS_REVIEW_TAG in latest_tags:
+            logger.info("%s now has %s; releasing claim", name, NEEDS_REVIEW_TAG)
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="released-claim",
+                success=False,
+                reason=f"Draft tagged {NEEDS_REVIEW_TAG}",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        if has_excluded_tag(latest_tags):
+            logger.info("%s now has an excluded tag; releasing claim", name)
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="released-claim",
+                success=False,
+                reason="Draft has excluded tag",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        if should_exclude_customer(latest):
+            logger.info("%s now has excluded customer after recheck: %s", name, safe_company_name(latest))
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="skipped",
+                success=False,
+                reason=f"Excluded customer: {safe_company_name(latest)}",
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        ship_date_value = ""
+        if latest.get("metafield"):
+            ship_date_value = latest["metafield"].get("value") or ""
+
+        ship_ok, ship_reason = ship_date_allows_release(ship_date_value, today)
+        logger.info("%s | ship-date-check=%s | %s", name, ship_ok, ship_reason)
+
+        if not ship_ok:
+            release_claim(latest)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="skipped",
+                success=False,
+                reason=ship_reason,
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            )
+            return
+
+        freight_ok, freight_action, freight_title, freight_price, freight_reason = ensure_shipping_logic(latest)
+        logger.info("%s | freight-check=%s | %s", name, freight_ok, freight_reason)
+
         latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="needs-review",
-            success=False,
-            reason=freight_reason,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            freight_action=freight_action,
-            freight_title=freight_title,
-            freight_price=freight_price,
+        current_freight_title = current_shipping_title(latest)
+        current_freight_price = current_shipping_price(latest)
+        logger.info(
+            "%s | shipping after update: %s @ %s",
+            name,
+            current_freight_title or "NONE",
+            current_freight_price or "NONE",
         )
-        return
 
-    subtotal = draft_subtotal_amount(latest)
-    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
-
-    if is_free_order:
-        assert subtotal == Decimal("0.00"), (
-            f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
-        )
-        logger.info("%s | $0.00 order detected; skipping payment terms step", name)
-
-        terms_stripped = strip_payment_terms(draft_id, name)
-        if not terms_stripped:
-            mark_needs_review(latest, "Could not strip payment terms from $0 order")
+        if not freight_ok:
+            mark_needs_review(latest, freight_reason)
+            claimed = False
             latest = recheck_draft(draft_id)
             log_draft_result(
                 latest,
                 action="needs-review",
                 success=False,
-                reason="Could not strip payment terms from $0 order",
+                reason=freight_reason,
                 existing_terms_before=existing_terms_before,
                 payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
                 freight_action=freight_action,
@@ -1298,130 +1248,201 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             )
             return
 
-        latest = recheck_draft(draft_id)
-        terms_ok = True
-        terms_reason = "Skipped - $0 free order; payment terms stripped"
-        detected_terms = ""
-        detected_days = None
-    else:
-        terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
-
-    logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
-
-    latest = recheck_draft(draft_id)
-    payment_terms_after = payment_terms_name(latest.get("paymentTerms"))
-    logger.info(
-        "%s | payment terms after update: %s",
-        name,
-        payment_terms_after or "NONE",
-    )
-
-    if not DRY_RUN and detected_terms:
-        if not payment_terms_after:
-            terms_ok = False
-            terms_reason = f"Detected {detected_terms} but payment terms are still blank after update"
-        elif not payment_terms_match_detected(latest.get("paymentTerms"), detected_days):
-            terms_ok = False
-            terms_reason = (
-                f"Detected {detected_terms} but Shopify returned "
-                f"'{payment_terms_after}' after update"
+        if not DRY_RUN and freight_action == "charge-freight":
+            if not shipping_line_matches(latest, freight_title, freight_price):
+                freight_ok = False
+                freight_reason = (
+                    f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
+                    f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}'"
+                )
+        elif DRY_RUN and freight_action == "charge-freight":
+            logger.info(
+                "%s | DRY RUN active; shipping remains unchanged on recheck because no mutation was sent",
+                name,
             )
-    elif DRY_RUN and detected_terms and not payment_terms_after:
+
+        if not freight_ok:
+            mark_needs_review(latest, freight_reason)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="needs-review",
+                success=False,
+                reason=freight_reason,
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+            )
+            return
+
+        subtotal = draft_subtotal_amount(latest)
+        is_free_order = subtotal is not None and subtotal == Decimal("0.00")
+
+        if is_free_order:
+            assert subtotal == Decimal("0.00"), (
+                f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
+            )
+            logger.info("%s | $0.00 order detected; skipping payment terms step", name)
+
+            terms_stripped = strip_payment_terms(draft_id, name)
+            if not terms_stripped:
+                mark_needs_review(latest, "Could not strip payment terms from $0 order")
+                claimed = False
+                latest = recheck_draft(draft_id)
+                log_draft_result(
+                    latest,
+                    action="needs-review",
+                    success=False,
+                    reason="Could not strip payment terms from $0 order",
+                    existing_terms_before=existing_terms_before,
+                    payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                    freight_action=freight_action,
+                    freight_title=freight_title,
+                    freight_price=freight_price,
+                )
+                return
+
+            latest = recheck_draft(draft_id)
+            terms_ok = True
+            terms_reason = "Skipped - $0 free order; payment terms stripped"
+            detected_terms = ""
+            detected_days = None
+        else:
+            terms_ok, terms_reason, detected_terms, detected_days = ensure_payment_terms(latest, now_dt)
+
+        logger.info("%s | payment-terms-check=%s | %s", name, terms_ok, terms_reason)
+
+        latest = recheck_draft(draft_id)
+        payment_terms_after = payment_terms_name(latest.get("paymentTerms"))
         logger.info(
-            "%s | DRY RUN active; payment terms remain unchanged on recheck because no mutation was sent",
+            "%s | payment terms after update: %s",
             name,
+            payment_terms_after or "NONE",
         )
 
-    if not terms_ok:
-        mark_needs_review(latest, terms_reason)
-        latest = recheck_draft(draft_id)
-        log_draft_result(
-            latest,
-            action="needs-review",
-            success=False,
-            reason=terms_reason,
-            detected_terms=detected_terms,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            freight_action=freight_action,
-            freight_title=freight_title,
-            freight_price=freight_price,
-        )
-        return
-
-    latest_tags = normalize_tags(latest.get("tags", []))
-    if PROCESSING_TAG not in latest_tags:
-        logger.warning(
-            "%s | PROCESSING_TAG missing before completion attempt; re-applying claim",
-            name,
-        )
-        claim_draft(latest)
-        latest = recheck_draft(draft_id)
-
-    if is_free_order:
-        logger.info("%s | $0.00 order; using free-order completion mutation", name)
-
-    completed = complete_draft(draft_id, is_free=is_free_order)
-
-    order_id = ""
-    order_name = ""
-    latest = recheck_draft(draft_id)
-
-    if not DRY_RUN:
-        order_id, order_name = validate_completion_result(
-            name=name,
-            draft_after_complete=latest,
-            completed_payload=completed,
-        )
-        logger.info(
-            "%s | completed successfully -> order %s",
-            name,
-            order_name or order_id,
-        )
-
-        mark_submitted(latest)
-        latest = recheck_draft(draft_id)
-
-        if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
-            raise RuntimeError(
-                f"{name} completed but {PROCESSING_TAG} is still present after mark_submitted"
+        if not DRY_RUN and detected_terms:
+            if not payment_terms_after:
+                terms_ok = False
+                terms_reason = f"Detected {detected_terms} but payment terms are still blank after update"
+            elif not payment_terms_match_detected(latest.get("paymentTerms"), detected_days):
+                terms_ok = False
+                terms_reason = (
+                    f"Detected {detected_terms} but Shopify returned "
+                    f"'{payment_terms_after}' after update"
+                )
+        elif DRY_RUN and detected_terms and not payment_terms_after:
+            logger.info(
+                "%s | DRY RUN active; payment terms remain unchanged on recheck because no mutation was sent",
+                name,
             )
 
-        if SUBMITTED_TAG not in normalize_tags(latest.get("tags", [])):
-            raise RuntimeError(
-                f"{name} completed but {SUBMITTED_TAG} was not present after final tag update"
+        if not terms_ok:
+            mark_needs_review(latest, terms_reason)
+            claimed = False
+            latest = recheck_draft(draft_id)
+            log_draft_result(
+                latest,
+                action="needs-review",
+                success=False,
+                reason=terms_reason,
+                detected_terms=detected_terms,
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+            )
+            return
+
+        if is_free_order:
+            logger.info("%s | $0.00 order; using free-order completion mutation", name)
+
+        completed = complete_draft(draft_id, is_free=is_free_order)
+
+        order_id = ""
+        order_name = ""
+        latest = recheck_draft(draft_id)
+
+        if not DRY_RUN:
+            order_id, order_name = validate_completion_result(
+                name=name,
+                draft_after_complete=latest,
+                completed_payload=completed,
+            )
+            logger.info(
+                "%s | completed successfully -> order %s",
+                name,
+                order_name or order_id,
             )
 
-    if DRY_RUN:
-        log_draft_result(
-            latest,
-            action="dry-run-complete",
-            success=True,
-            reason="Draft would have been completed" + (" (free order)" if is_free_order else ""),
-            detected_terms=detected_terms,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            freight_action=freight_action,
-            freight_title=freight_title,
-            freight_price=freight_price,
-            order_id=order_id,
-            order_name=order_name,
-        )
-    else:
-        log_draft_result(
-            latest,
-            action="completed",
-            success=True,
-            reason="Draft completed successfully" + (" (free order)" if is_free_order else ""),
-            detected_terms=detected_terms,
-            existing_terms_before=existing_terms_before,
-            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-            freight_action=freight_action,
-            freight_title=freight_title,
-            freight_price=freight_price,
-            order_id=order_id,
-            order_name=order_name,
-        )
+            mark_submitted(latest)
+            latest = recheck_draft(draft_id)
+
+            if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
+                raise RuntimeError(
+                    f"{name} completed but {PROCESSING_TAG} is still present after mark_submitted"
+                )
+
+            if SUBMITTED_TAG not in normalize_tags(latest.get("tags", [])):
+                raise RuntimeError(
+                    f"{name} completed but {SUBMITTED_TAG} was not present after final tag update"
+                )
+
+        completed_successfully = True
+
+        if DRY_RUN:
+            log_draft_result(
+                latest,
+                action="dry-run-complete",
+                success=True,
+                reason="Draft would have been completed" + (" (free order)" if is_free_order else ""),
+                detected_terms=detected_terms,
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+                order_id=order_id,
+                order_name=order_name,
+            )
+        else:
+            log_draft_result(
+                latest,
+                action="completed",
+                success=True,
+                reason="Draft completed successfully" + (" (free order)" if is_free_order else ""),
+                detected_terms=detected_terms,
+                existing_terms_before=existing_terms_before,
+                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+                freight_action=freight_action,
+                freight_title=freight_title,
+                freight_price=freight_price,
+                order_id=order_id,
+                order_name=order_name,
+            )
+
+    finally:
+        if claimed and not DRY_RUN:
+            try:
+                latest = recheck_draft(draft_id)
+
+                if completed_successfully:
+                    if PROCESSING_TAG in normalize_tags(latest.get("tags", [])):
+                        logger.warning("%s | cleanup finally removing lingering %s", name, PROCESSING_TAG)
+                        release_claim(latest)
+                else:
+                    current_tags = normalize_tags(latest.get("tags", []))
+                    if PROCESSING_TAG in current_tags or SUBMITTED_TAG in current_tags:
+                        logger.warning(
+                            "%s | cleanup finally removing lingering processing/submitted tags",
+                            name,
+                        )
+                        finalize_non_success_tags(latest)
+            except Exception as cleanup_exc:
+                logger.warning("%s | finally cleanup failed: %s", name, cleanup_exc)
 
 
 def main() -> None:
@@ -1436,8 +1457,9 @@ def main() -> None:
             try:
                 latest = recheck_draft(draft["id"])
 
-                if SUBMITTED_TAG in normalize_tags(latest.get("tags", [])):
-                    clear_submitted_tag(latest)
+                current_tags = normalize_tags(latest.get("tags", []))
+                if PROCESSING_TAG in current_tags or SUBMITTED_TAG in current_tags:
+                    finalize_non_success_tags(latest)
                     latest = recheck_draft(draft["id"])
 
                 mark_needs_review(latest, str(exc))
