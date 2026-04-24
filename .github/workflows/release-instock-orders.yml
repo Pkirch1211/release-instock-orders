@@ -36,6 +36,8 @@ jobs:
           SHIP_DATE_KEY: ${{ vars.SHIP_DATE_KEY }}
           EXCLUDE_TAGS: ${{ vars.EXCLUDE_TAGS }}
           EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+          EXCLUDED_SKUS: ${{ vars.EXCLUDED_SKUS }}
           DRY_RUN: ${{ vars.DRY_RUN }}
           LOG_LEVEL: ${{ vars.LOG_LEVEL }}
           DRAFTS_PAGE_SIZE: ${{ vars.DRAFTS_PAGE_SIZE }}
