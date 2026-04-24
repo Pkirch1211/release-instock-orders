@@ -60,6 +60,12 @@ EXCLUDED_CUSTOMER_SUBSTRINGS = {
     if c.strip()
 }
 
+EXCLUDED_SKUS = {
+    sku.strip().upper()
+    for sku in os.getenv("EXCLUDED_SKUS", "").split(",")
+    if sku.strip()
+}
+
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 DRAFTS_PAGE_SIZE = int(os.getenv("DRAFTS_PAGE_SIZE", "25").strip())
@@ -168,6 +174,15 @@ query CandidateDrafts(
             }
           }
         }
+        lineItems(first: 250) {
+          edges {
+            node {
+              sku
+              title
+              quantity
+            }
+          }
+        }
         purchasingEntity {
           __typename
           ... on Customer {
@@ -235,6 +250,15 @@ query RecheckDraft(
         shopMoney {
           amount
           currencyCode
+        }
+      }
+    }
+    lineItems(first: 250) {
+      edges {
+        node {
+          sku
+          title
+          quantity
         }
       }
     }
@@ -475,6 +499,37 @@ def should_exclude_customer(draft: dict) -> bool:
     return False
 
 
+def draft_line_item_skus(draft: dict) -> List[str]:
+    line_items = draft.get("lineItems") or {}
+    edges = line_items.get("edges") or []
+
+    skus: List[str] = []
+    for edge in edges:
+        node = edge.get("node") or {}
+        sku = (node.get("sku") or "").strip()
+        if sku:
+            skus.append(sku)
+
+    return skus
+
+
+def excluded_skus_on_draft(draft: dict) -> List[str]:
+    if not EXCLUDED_SKUS:
+        return []
+
+    normalized_excluded = {sku.upper() for sku in EXCLUDED_SKUS}
+    matched = {
+        sku
+        for sku in draft_line_item_skus(draft)
+        if sku.strip().upper() in normalized_excluded
+    }
+    return sorted(matched, key=lambda value: value.upper())
+
+
+def should_exclude_sku(draft: dict) -> bool:
+    return bool(excluded_skus_on_draft(draft))
+
+
 def ensure_csv_exists() -> None:
     path = Path(CSV_LOG_PATH)
     if not path.exists():
@@ -575,6 +630,8 @@ def fetch_candidate_drafts() -> List[dict]:
     logger.info("Fetched %s candidate draft(s)", len(drafts))
     if COMPLETE_DRAFT_NAMES:
         logger.info("COMPLETE_DRAFT_NAMES active: %s", sorted(COMPLETE_DRAFT_NAMES))
+    if EXCLUDED_SKUS:
+        logger.info("EXCLUDED_SKUS active: %s", sorted(EXCLUDED_SKUS))
     return drafts
 
 
@@ -1170,6 +1227,18 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         logger.info("Skipping %s because customer is excluded: %s", name, safe_company_name(draft))
         return
 
+    excluded_skus = excluded_skus_on_draft(draft)
+    if excluded_skus:
+        logger.info("Skipping %s because it contains excluded SKU(s): %s", name, ", ".join(excluded_skus))
+        log_draft_result(
+            draft,
+            action="skipped",
+            success=False,
+            reason=f"Excluded SKU(s): {', '.join(excluded_skus)}",
+            existing_terms_before=existing_terms_before,
+        )
+        return
+
     logger.info("-----")
     logger.info("Evaluating %s", name)
 
@@ -1268,6 +1337,21 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             action="skipped",
             success=False,
             reason=f"Excluded customer: {safe_company_name(latest)}",
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+        )
+        return
+
+    excluded_skus = excluded_skus_on_draft(latest)
+    if excluded_skus:
+        logger.info("%s now has excluded SKU(s) after recheck: %s", name, ", ".join(excluded_skus))
+        release_claim(latest)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="skipped",
+            success=False,
+            reason=f"Excluded SKU(s): {', '.join(excluded_skus)}",
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
         )
