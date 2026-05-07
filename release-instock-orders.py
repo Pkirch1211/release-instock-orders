@@ -823,6 +823,21 @@ def finalize_completed_order_tags(
             f"{order_name or order_id} completed but {SUBMITTED_TAG} is missing on order after tag update"
         )
 
+    try:
+        logger.info(
+            "%s | cleaning completed draft tags to remove %s and add %s",
+            draft_before_complete.get("name") or draft_before_complete.get("id"),
+            PROCESSING_TAG,
+            SUBMITTED_TAG,
+        )
+        update_draft(draft_before_complete["id"], {"tags": final_order_tags})
+    except Exception as exc:
+        logger.warning(
+            "%s | completed order tags were updated, but completed draft tag cleanup failed: %s",
+            draft_before_complete.get("name") or draft_before_complete.get("id"),
+            exc,
+        )
+
     return latest_order
 
 
