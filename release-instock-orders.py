@@ -20,6 +20,7 @@ load_dotenv()
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_TOKEN", "").strip()
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-07").strip()
+SHOPIFY_LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID", "").strip()
 
 READY_TAG = os.getenv("READY_TAG", "instock-ready").strip()
 PROCESSING_TAG = os.getenv("PROCESSING_TAG", "order-push-processing").strip()
@@ -69,6 +70,9 @@ EXCLUDED_SKUS = {
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 DRAFTS_PAGE_SIZE = int(os.getenv("DRAFTS_PAGE_SIZE", "25").strip())
+INVENTORY_REVIEW_THRESHOLD = int(os.getenv("INVENTORY_REVIEW_THRESHOLD", "350").strip())
+INVENTORY_BATCH_SIZE = int(os.getenv("INVENTORY_BATCH_SIZE", "25").strip())
+INVENTORY_LEVELS_PAGE_SIZE = int(os.getenv("INVENTORY_LEVELS_PAGE_SIZE", "20").strip())
 
 CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip()
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -97,8 +101,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not SHOPIFY_SHOP or not SHOPIFY_TOKEN:
-    logger.error("Missing required environment variables: SHOPIFY_SHOP and/or SHOPIFY_TOKEN")
+if not SHOPIFY_SHOP or not SHOPIFY_TOKEN or not SHOPIFY_LOCATION_ID:
+    logger.error(
+        "Missing required environment variables: SHOPIFY_SHOP, SHOPIFY_TOKEN, and/or SHOPIFY_LOCATION_ID"
+    )
     sys.exit(1)
 
 GRAPHQL_URL = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -180,6 +186,15 @@ query CandidateDrafts(
               sku
               title
               quantity
+              variant {
+                id
+                displayName
+                inventoryItem {
+                  id
+                  tracked
+                  sku
+                }
+              }
             }
           }
         }
@@ -307,6 +322,32 @@ query RecheckOrder($id: ID!) {
 }
 """
 
+INVENTORY_ITEMS_QUERY = """
+query GetInventoryItems($ids: [ID!]!, $levelsPageSize: Int!) {
+  nodes(ids: $ids) {
+    ... on InventoryItem {
+      id
+      tracked
+      sku
+      inventoryLevels(first: $levelsPageSize) {
+        edges {
+          node {
+            location {
+              id
+              name
+            }
+            quantities(names: ["available"]) {
+              name
+              quantity
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 DRAFT_UPDATE_MUTATION = """
 mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
   draftOrderUpdate(id: $id, input: $input) {
@@ -421,6 +462,10 @@ def shopify_graphql(query: str, variables: Optional[dict] = None) -> dict:
     return payload["data"]
 
 
+def chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
 def normalize_tags(tags: List[str]) -> List[str]:
     return sorted({tag.strip() for tag in tags if tag and tag.strip()})
 
@@ -528,6 +573,147 @@ def excluded_skus_on_draft(draft: dict) -> List[str]:
 
 def should_exclude_sku(draft: dict) -> bool:
     return bool(excluded_skus_on_draft(draft))
+
+
+def draft_inventory_item_ids(draft: dict) -> List[str]:
+    line_items = draft.get("lineItems") or {}
+    edges = line_items.get("edges") or []
+
+    ids = set()
+    for edge in edges:
+        node = edge.get("node") or {}
+        variant = node.get("variant")
+        if not variant:
+            continue
+
+        inventory_item = variant.get("inventoryItem")
+        if not inventory_item:
+            continue
+
+        inventory_item_id = inventory_item.get("id")
+        tracked = bool(inventory_item.get("tracked"))
+
+        if inventory_item_id and tracked:
+            ids.add(inventory_item_id)
+
+    return sorted(ids)
+
+
+def available_at_location(inventory_levels_edges: List[dict], location_id: str) -> Optional[int]:
+    for edge in inventory_levels_edges:
+        node = edge.get("node") or {}
+        location = node.get("location")
+
+        if location and location.get("id") == location_id:
+            for qty in node.get("quantities", []):
+                if qty.get("name") == "available":
+                    return int(qty.get("quantity", 0))
+            return 0
+
+    return None
+
+
+def fetch_inventory_availability(inventory_item_ids: List[str]) -> Dict[str, Dict[str, Optional[int]]]:
+    results: Dict[str, Dict[str, Optional[int]]] = {}
+
+    if not inventory_item_ids:
+        return results
+
+    batches = chunked(inventory_item_ids, INVENTORY_BATCH_SIZE)
+
+    for batch_num, batch_ids in enumerate(batches, start=1):
+        data = shopify_graphql(
+            INVENTORY_ITEMS_QUERY,
+            {
+                "ids": batch_ids,
+                "levelsPageSize": INVENTORY_LEVELS_PAGE_SIZE,
+            },
+        )
+
+        nodes = data.get("nodes", [])
+        logger.info(
+            "Fetched inventory threshold batch %s/%s (%s inventory items)",
+            batch_num,
+            len(batches),
+            len(batch_ids),
+        )
+
+        for node in nodes:
+            if not node:
+                continue
+
+            inventory_item_id = node.get("id")
+            if not inventory_item_id:
+                continue
+
+            levels = node.get("inventoryLevels", {}).get("edges", [])
+            results[inventory_item_id] = {
+                "sku": node.get("sku") or "(no sku)",
+                "available": available_at_location(levels, SHOPIFY_LOCATION_ID),
+            }
+
+    return results
+
+
+def inventory_threshold_review_reasons(draft: dict) -> List[str]:
+    reasons: List[str] = []
+    inventory_item_ids = draft_inventory_item_ids(draft)
+    availability_map = fetch_inventory_availability(inventory_item_ids)
+
+    line_items = draft.get("lineItems") or {}
+    edges = line_items.get("edges") or []
+
+    for edge in edges:
+        line = edge.get("node") or {}
+        title = (line.get("title") or "unknown").strip()
+        variant = line.get("variant")
+
+        if not variant:
+            logger.info("Draft %s | inventory threshold check ignoring custom line: %s", draft.get("name"), title)
+            continue
+
+        inventory_item = variant.get("inventoryItem")
+        if not inventory_item:
+            reasons.append(
+                f"Variant has no inventory item: {variant.get('displayName', title)}"
+            )
+            continue
+
+        tracked = bool(inventory_item.get("tracked"))
+        sku = (
+            inventory_item.get("sku")
+            or line.get("sku")
+            or variant.get("displayName")
+            or title
+            or "(no sku)"
+        )
+        inventory_item_id = inventory_item.get("id")
+
+        if not tracked:
+            logger.info("Draft %s | inventory threshold check ignoring untracked item: %s", draft.get("name"), sku)
+            continue
+
+        if not inventory_item_id:
+            reasons.append(f"Missing inventory item ID for {sku}")
+            continue
+
+        availability_info = availability_map.get(inventory_item_id)
+        if not availability_info:
+            reasons.append(f"No inventory lookup result for {sku}")
+            continue
+
+        available = availability_info.get("available")
+
+        if available is None:
+            reasons.append(f"No inventory level at target location for {sku}")
+            continue
+
+        if available < INVENTORY_REVIEW_THRESHOLD:
+            reasons.append(
+                f"Available inventory below {INVENTORY_REVIEW_THRESHOLD} for {sku}: available {available}"
+            )
+
+    return reasons
 
 
 def ensure_csv_exists() -> None:
@@ -1526,6 +1712,35 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
             freight_price=freight_price,
         )
         return
+
+    latest = recheck_draft(draft_id)
+    inventory_review_reasons = inventory_threshold_review_reasons(latest)
+
+    if inventory_review_reasons:
+        inventory_reason = "; ".join(inventory_review_reasons)
+        logger.info("%s | inventory-threshold-check=False | %s", name, inventory_reason)
+
+        mark_needs_review(latest, inventory_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="needs-review",
+            success=False,
+            reason=inventory_reason,
+            detected_terms=detected_terms,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
+    logger.info(
+        "%s | inventory-threshold-check=True | all tracked items have at least %s available at target location",
+        name,
+        INVENTORY_REVIEW_THRESHOLD,
+    )
 
     draft_state_before_complete = recheck_draft(draft_id)
 
