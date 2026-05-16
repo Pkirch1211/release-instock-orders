@@ -28,27 +28,42 @@ jobs:
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          INVENTORY_REVIEW_THRESHOLD: ${{ vars.INVENTORY_REVIEW_THRESHOLD }}
+          INVENTORY_BATCH_SIZE: ${{ vars.INVENTORY_BATCH_SIZE }}
+          INVENTORY_LEVELS_PAGE_SIZE: ${{ vars.INVENTORY_LEVELS_PAGE_SIZE }}
+
           READY_TAG: ${{ vars.READY_TAG }}
           PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
           SUBMITTED_TAG: ${{ vars.SUBMITTED_TAG }}
           NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
+
           SHIP_DATE_NAMESPACE: ${{ vars.SHIP_DATE_NAMESPACE }}
           SHIP_DATE_KEY: ${{ vars.SHIP_DATE_KEY }}
+
           EXCLUDE_TAGS: ${{ vars.EXCLUDE_TAGS }}
           EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
           EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
           EXCLUDED_SKUS: ${{ vars.EXCLUDED_SKUS }}
+
           DRY_RUN: ${{ vars.DRY_RUN }}
           LOG_LEVEL: ${{ vars.LOG_LEVEL }}
           DRAFTS_PAGE_SIZE: ${{ vars.DRAFTS_PAGE_SIZE }}
           CSV_LOG_PATH: ${{ vars.CSV_LOG_PATH }}
+
+          FREIGHT_RATE_PERCENT: ${{ vars.FREIGHT_RATE_PERCENT }}
+          DEFAULT_FREIGHT_TITLE: ${{ vars.DEFAULT_FREIGHT_TITLE }}
+
+          DEFAULT_PAYMENT_TERMS_TEMPLATE_ID: ${{ secrets.DEFAULT_PAYMENT_TERMS_TEMPLATE_ID }}
           PAYMENT_TERMS_TEMPLATE_ID_NET30: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET30 }}
           PAYMENT_TERMS_TEMPLATE_ID_NET45: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET45 }}
           PAYMENT_TERMS_TEMPLATE_ID_NET60: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET60 }}
           PAYMENT_TERMS_TEMPLATE_ID_NET90: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET90 }}
           PAYMENT_TERMS_TEMPLATE_ID_NET120: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET120 }}
+
           COMPLETE_DRAFT_NAMES: ${{ vars.COMPLETE_DRAFT_NAMES }}
-        run: python release-instock-orders.py
+        run: python release-instock-ready.py
 
       - name: Upload CSV log
         if: always()
