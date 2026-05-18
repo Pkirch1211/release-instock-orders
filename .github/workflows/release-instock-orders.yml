@@ -63,7 +63,7 @@ jobs:
           PAYMENT_TERMS_TEMPLATE_ID_NET120: ${{ secrets.PAYMENT_TERMS_TEMPLATE_ID_NET120 }}
 
           COMPLETE_DRAFT_NAMES: ${{ vars.COMPLETE_DRAFT_NAMES }}
-        run: python release-instock-ready.py
+        run: python release-instock-orders.py
 
       - name: Upload CSV log
         if: always()
