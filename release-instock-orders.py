@@ -237,6 +237,8 @@ query CandidateDrafts(
 }
 """
 
+# FIX: Added variant.inventoryItem to line items so excluded SKU checks
+# work correctly on rechecked drafts, matching CANDIDATE_DRAFTS_QUERY.
 DRAFT_RECHECK_QUERY = """
 query RecheckDraft(
   $id: ID!,
@@ -274,6 +276,15 @@ query RecheckDraft(
           sku
           title
           quantity
+          variant {
+            id
+            displayName
+            inventoryItem {
+              id
+              tracked
+              sku
+            }
+          }
         }
       }
     }
@@ -545,6 +556,12 @@ def should_exclude_customer(draft: dict) -> bool:
 
 
 def draft_line_item_skus(draft: dict) -> List[str]:
+    """
+    Return SKUs for all line items. Prefers the line item's own sku field,
+    but falls back to variant.inventoryItem.sku if the line item sku is blank.
+    This ensures excluded SKU checks work even when Shopify omits the top-level
+    sku on draft order line items.
+    """
     line_items = draft.get("lineItems") or {}
     edges = line_items.get("edges") or []
 
@@ -552,6 +569,12 @@ def draft_line_item_skus(draft: dict) -> List[str]:
     for edge in edges:
         node = edge.get("node") or {}
         sku = (node.get("sku") or "").strip()
+
+        if not sku:
+            variant = node.get("variant") or {}
+            inventory_item = variant.get("inventoryItem") or {}
+            sku = (inventory_item.get("sku") or "").strip()
+
         if sku:
             skus.append(sku)
 
