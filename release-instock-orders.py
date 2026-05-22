@@ -744,13 +744,13 @@ def inventory_threshold_review_reasons(draft: dict) -> List[str]:
 
         availability_info = availability_map.get(inventory_item_id)
         if not availability_info:
-            reasons.append(f"No inventory lookup result for {sku}")
+            logger.info("Draft %s | inventory threshold check ignoring item with no availability data: %s", draft.get("name"), sku)
             continue
 
         available = availability_info.get("available")
 
         if available is None:
-            reasons.append(f"No inventory level at target location for {sku}")
+            logger.info("Draft %s | inventory threshold check ignoring item with no location record: %s", draft.get("name"), sku)
             continue
 
         if available < INVENTORY_REVIEW_THRESHOLD:
