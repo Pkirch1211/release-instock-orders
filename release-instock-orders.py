@@ -46,6 +46,15 @@ COMPLETE_DRAFT_NAMES = {
     if name.strip()
 }
 
+# If set, ONLY these draft names will be processed. All others are skipped.
+# Accepts comma-separated list with or without leading #.
+# Leave unset or empty for normal operation (process all eligible drafts).
+PROCESS_ONLY_DRAFTS = {
+    name.strip().replace("#", "").upper()
+    for name in os.getenv("PROCESS_ONLY_DRAFTS", "").split(",")
+    if name.strip()
+}
+
 # IMPORTANT:
 # No fallback defaults here. If you do not explicitly set these env vars,
 # nothing is excluded by customer name.
@@ -238,7 +247,8 @@ query CandidateDrafts(
 """
 
 # FIX: Added variant.inventoryItem to line items so excluded SKU checks
-# work correctly on rechecked drafts, matching CANDIDATE_DRAFTS_QUERY.
+# and inventory threshold checks work correctly on rechecked drafts,
+# matching CANDIDATE_DRAFTS_QUERY.
 DRAFT_RECHECK_QUERY = """
 query RecheckDraft(
   $id: ID!,
@@ -506,9 +516,17 @@ def normalize_draft_name(name: str) -> str:
 
 
 def should_process_draft(draft_name: str) -> bool:
-    if not COMPLETE_DRAFT_NAMES:
-        return True
-    return normalize_draft_name(draft_name) in {n.upper() for n in COMPLETE_DRAFT_NAMES}
+    normalized = normalize_draft_name(draft_name)
+
+    # Hard allowlist: if set, only process drafts explicitly listed
+    if PROCESS_ONLY_DRAFTS:
+        return normalized in PROCESS_ONLY_DRAFTS
+
+    # Soft allowlist: if set, only process drafts in COMPLETE_DRAFT_NAMES
+    if COMPLETE_DRAFT_NAMES:
+        return normalized in {n.upper() for n in COMPLETE_DRAFT_NAMES}
+
+    return True
 
 
 def payment_terms_name(payment_terms: Optional[dict]) -> str:
@@ -691,8 +709,12 @@ def inventory_threshold_review_reasons(draft: dict) -> List[str]:
         title = (line.get("title") or "unknown").strip()
         variant = line.get("variant")
 
+        # FIX: Custom lines (no variant) cannot have inventory verified.
+        # Flag for review instead of silently assuming inventory is available.
         if not variant:
-            logger.info("Draft %s | inventory threshold check ignoring custom line: %s", draft.get("name"), title)
+            reasons.append(
+                f"Custom line item with no variant — cannot verify inventory: {title}"
+            )
             continue
 
         inventory_item = variant.get("inventoryItem")
@@ -837,6 +859,8 @@ def fetch_candidate_drafts() -> List[dict]:
         cursor = connection["pageInfo"]["endCursor"]
 
     logger.info("Fetched %s candidate draft(s)", len(drafts))
+    if PROCESS_ONLY_DRAFTS:
+        logger.info("PROCESS_ONLY_DRAFTS active — hard allowlist: %s", sorted(PROCESS_ONLY_DRAFTS))
     if COMPLETE_DRAFT_NAMES:
         logger.info("COMPLETE_DRAFT_NAMES active: %s", sorted(COMPLETE_DRAFT_NAMES))
     if EXCLUDED_SKUS:
@@ -1440,7 +1464,7 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
     freight_price = ""
 
     if not should_process_draft(name):
-        logger.info("Skipping %s because it is not in COMPLETE_DRAFT_NAMES", name)
+        logger.info("Skipping %s because it is not in the active allowlist", name)
         return
 
     if has_excluded_tag(tags):
