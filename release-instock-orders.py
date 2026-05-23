@@ -81,7 +81,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 DRAFTS_PAGE_SIZE = int(os.getenv("DRAFTS_PAGE_SIZE", "25").strip())
 INVENTORY_REVIEW_THRESHOLD = int(os.getenv("INVENTORY_REVIEW_THRESHOLD", "350").strip())
 INVENTORY_BATCH_SIZE = int(os.getenv("INVENTORY_BATCH_SIZE", "25").strip())
-INVENTORY_LEVELS_PAGE_SIZE = int(os.getenv("INVENTORY_LEVELS_PAGE_SIZE", "20").strip())
+INVENTORY_LEVELS_PAGE_SIZE = int(os.getenv("INVENTORY_LEVELS_PAGE_SIZE", "250").strip())
 
 CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip()
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -640,12 +640,34 @@ def draft_inventory_item_ids(draft: dict) -> List[str]:
     return sorted(ids)
 
 
+def location_ids_match(returned_location_id: str, configured_location_id: str) -> bool:
+    """
+    Shopify GraphQL returns location IDs as GIDs, e.g. gid://shopify/Location/123.
+    Some env/secrets may be configured as either the full GID or just the numeric ID.
+    Compare both safely so inventory lookup does not fail open because of ID format.
+    """
+    returned_location_id = (returned_location_id or "").strip()
+    configured_location_id = (configured_location_id or "").strip()
+
+    if not returned_location_id or not configured_location_id:
+        return False
+
+    if returned_location_id == configured_location_id:
+        return True
+
+    returned_numeric = returned_location_id.rsplit("/", 1)[-1]
+    configured_numeric = configured_location_id.rsplit("/", 1)[-1]
+
+    return returned_numeric == configured_numeric
+
+
 def available_at_location(inventory_levels_edges: List[dict], location_id: str) -> Optional[int]:
     for edge in inventory_levels_edges:
         node = edge.get("node") or {}
-        location = node.get("location")
+        location = node.get("location") or {}
+        returned_location_id = location.get("id") or ""
 
-        if location and location.get("id") == location_id:
+        if location_ids_match(returned_location_id, location_id):
             for qty in node.get("quantities", []):
                 if qty.get("name") == "available":
                     return int(qty.get("quantity", 0))
@@ -750,7 +772,9 @@ def inventory_threshold_review_reasons(draft: dict) -> List[str]:
         available = availability_info.get("available")
 
         if available is None:
-            logger.info("Draft %s | inventory threshold check ignoring item with no location record: %s", draft.get("name"), sku)
+            reasons.append(
+                f"No inventory record found at configured location {SHOPIFY_LOCATION_ID} for {sku}"
+            )
             continue
 
         if available < INVENTORY_REVIEW_THRESHOLD:
@@ -1690,28 +1714,25 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         assert subtotal == Decimal("0.00"), (
             f"Safety check failed: expected $0.00 but got {subtotal} on {name}"
         )
-        logger.info("%s | $0.00 order detected; skipping payment terms step", name)
+
+        logger.info(
+            "%s | $0.00 order detected; attempting to remove payment terms before free completion",
+            name,
+        )
 
         terms_stripped = strip_payment_terms(draft_id, name)
-        if not terms_stripped:
-            mark_needs_review(latest, "Could not strip payment terms from $0 order")
-            latest = recheck_draft(draft_id)
-            log_draft_result(
-                latest,
-                action="needs-review",
-                success=False,
-                reason="Could not strip payment terms from $0 order",
-                existing_terms_before=existing_terms_before,
-                payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
-                freight_action=freight_action,
-                freight_title=freight_title,
-                freight_price=freight_price,
-            )
-            return
-
         latest = recheck_draft(draft_id)
+
+        if terms_stripped:
+            terms_reason = "Skipped - $0 free order; payment terms stripped"
+        else:
+            terms_reason = (
+                "Skipped - $0 free order; payment terms could not be stripped, "
+                "will attempt free-order completion anyway"
+            )
+            logger.warning("%s | %s", name, terms_reason)
+
         terms_ok = True
-        terms_reason = "Skipped - $0 free order; payment terms stripped"
         detected_terms = ""
         detected_days = None
     else:
