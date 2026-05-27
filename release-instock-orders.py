@@ -26,6 +26,7 @@ READY_TAG = os.getenv("READY_TAG", "instock-ready").strip()
 PROCESSING_TAG = os.getenv("PROCESSING_TAG", "order-push-processing").strip()
 SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
 NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
+LOW_SUPPLY_TAG = os.getenv("LOW_SUPPLY_TAG", "low-supply").strip()
 
 SHIP_DATE_NAMESPACE = os.getenv("SHIP_DATE_NAMESPACE", "b2b").strip()
 SHIP_DATE_KEY = os.getenv("SHIP_DATE_KEY", "ship_date").strip()
@@ -34,11 +35,12 @@ EXCLUDE_TAGS = {
     t.strip()
     for t in os.getenv(
         "EXCLUDE_TAGS",
-        "split-backorder-child,split-backorder-processing,needs-review",
+        "split-backorder-child,split-backorder-processing,needs-review,low-supply",
     ).split(",")
     if t.strip()
 }
 EXCLUDE_TAGS.add(NEEDS_REVIEW_TAG)
+EXCLUDE_TAGS.add(LOW_SUPPLY_TAG)
 
 COMPLETE_DRAFT_NAMES = {
     name.strip().replace("#", "")
@@ -159,7 +161,7 @@ query CandidateDrafts(
   draftOrders(
     first: $pageSize,
     after: $cursor,
-    query: "status:open tag:instock-ready -tag:needs-review -tag:order-push-processing -tag:order-submitted"
+    query: "status:open tag:instock-ready -tag:needs-review -tag:low-supply -tag:order-push-processing -tag:order-submitted"
   ) {
     edges {
       cursor
@@ -1024,6 +1026,19 @@ def mark_needs_review(draft: dict, reason: Optional[str] = None) -> None:
         logger.warning("%s | marked %s | %s", draft.get("name"), NEEDS_REVIEW_TAG, reason)
 
 
+def mark_low_supply(draft: dict, reason: Optional[str] = None) -> None:
+    current_tags = normalize_tags(draft.get("tags", []))
+    final_tags = add_tags(current_tags, LOW_SUPPLY_TAG)
+    final_tags = remove_tags(
+        final_tags,
+        PROCESSING_TAG,
+        SUBMITTED_TAG,
+    )
+    update_draft(draft["id"], {"tags": final_tags})
+    if reason:
+        logger.warning("%s | marked %s | %s", draft.get("name"), LOW_SUPPLY_TAG, reason)
+
+
 def validate_completion_result(
     *,
     name: str,
@@ -1057,7 +1072,7 @@ def finalize_completed_order_tags(
 ) -> dict:
     draft_tags_before_complete = normalize_tags(draft_before_complete.get("tags", []))
     final_order_tags = add_tags(
-        remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG),
+        remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG, LOW_SUPPLY_TAG),
         SUBMITTED_TAG,
     )
 
@@ -1788,11 +1803,11 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         inventory_reason = "; ".join(inventory_review_reasons)
         logger.info("%s | inventory-threshold-check=False | %s", name, inventory_reason)
 
-        mark_needs_review(latest, inventory_reason)
+        mark_low_supply(latest, inventory_reason)
         latest = recheck_draft(draft_id)
         log_draft_result(
             latest,
-            action="needs-review",
+            action="low-supply",
             success=False,
             reason=inventory_reason,
             detected_terms=detected_terms,
