@@ -35,12 +35,11 @@ EXCLUDE_TAGS = {
     t.strip()
     for t in os.getenv(
         "EXCLUDE_TAGS",
-        "split-backorder-child,split-backorder-processing,needs-review,low-supply",
+        "split-backorder-child,split-backorder-processing,needs-review",
     ).split(",")
     if t.strip()
 }
 EXCLUDE_TAGS.add(NEEDS_REVIEW_TAG)
-EXCLUDE_TAGS.add(LOW_SUPPLY_TAG)
 
 COMPLETE_DRAFT_NAMES = {
     name.strip().replace("#", "")
@@ -161,7 +160,7 @@ query CandidateDrafts(
   draftOrders(
     first: $pageSize,
     after: $cursor,
-    query: "status:open tag:instock-ready -tag:needs-review -tag:low-supply -tag:order-push-processing -tag:order-submitted"
+    query: "status:open tag:instock-ready -tag:needs-review -tag:order-push-processing -tag:order-submitted"
   ) {
     edges {
       cursor
