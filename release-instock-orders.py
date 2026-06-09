@@ -45,8 +45,7 @@ EXCLUDE_TAGS = {
     if t.strip()
 }
 EXCLUDE_TAGS.add(NEEDS_REVIEW_TAG)
-EXCLUDE_TAGS.add(LOW_SUPPLY_TAG)
-EXCLUDE_TAGS.add(INVENTORY_SHORTAGE_TAG)
+
 
 COMPLETE_DRAFT_NAMES = {
     name.strip().replace("#", "")
