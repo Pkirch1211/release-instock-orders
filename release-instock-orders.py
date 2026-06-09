@@ -27,6 +27,11 @@ PROCESSING_TAG = os.getenv("PROCESSING_TAG", "order-push-processing").strip()
 SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
 NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
 LOW_SUPPLY_TAG = os.getenv("LOW_SUPPLY_TAG", "low-supply").strip()
+INVENTORY_SHORTAGE_TAG = os.getenv("INVENTORY_SHORTAGE_TAG", "inventory-shortage").strip()
+
+INVENTORY_REVIEW_NAMESPACE = os.getenv("INVENTORY_REVIEW_NAMESPACE", "b2b").strip()
+INVENTORY_REVIEW_KEY = os.getenv("INVENTORY_REVIEW_KEY", "inventory_review_reason").strip()
+INVENTORY_REVIEW_TYPE = os.getenv("INVENTORY_REVIEW_TYPE", "multi_line_text_field").strip()
 
 SHIP_DATE_NAMESPACE = os.getenv("SHIP_DATE_NAMESPACE", "b2b").strip()
 SHIP_DATE_KEY = os.getenv("SHIP_DATE_KEY", "ship_date").strip()
@@ -40,6 +45,8 @@ EXCLUDE_TAGS = {
     if t.strip()
 }
 EXCLUDE_TAGS.add(NEEDS_REVIEW_TAG)
+EXCLUDE_TAGS.add(LOW_SUPPLY_TAG)
+EXCLUDE_TAGS.add(INVENTORY_SHORTAGE_TAG)
 
 COMPLETE_DRAFT_NAMES = {
     name.strip().replace("#", "")
@@ -83,6 +90,11 @@ DRAFTS_PAGE_SIZE = int(os.getenv("DRAFTS_PAGE_SIZE", "25").strip())
 INVENTORY_REVIEW_THRESHOLD = int(os.getenv("INVENTORY_REVIEW_THRESHOLD", "350").strip())
 INVENTORY_BATCH_SIZE = int(os.getenv("INVENTORY_BATCH_SIZE", "25").strip())
 INVENTORY_LEVELS_PAGE_SIZE = int(os.getenv("INVENTORY_LEVELS_PAGE_SIZE", "250").strip())
+
+# In-run inventory reservation pool. This prevents two drafts in the same run
+# from both passing against the same starting available quantity.
+# Shape: {inventory_item_id: {"sku": str, "available": Optional[int]}}
+InventoryPool = Dict[str, Dict[str, Optional[int]]]
 
 CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip()
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -424,6 +436,25 @@ mutation UpdateOrder($input: OrderInput!) {
 }
 """
 
+METAFIELDS_SET_MUTATION = """
+mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields {
+      id
+      namespace
+      key
+      type
+      value
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+"""
+
 DRAFT_COMPLETE_MUTATION = """
 mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
   draftOrderComplete(id: $id, paymentPending: $paymentPending) {
@@ -719,10 +750,25 @@ def fetch_inventory_availability(inventory_item_ids: List[str]) -> Dict[str, Dic
     return results
 
 
-def inventory_threshold_review_reasons(draft: dict) -> List[str]:
-    reasons: List[str] = []
-    inventory_item_ids = draft_inventory_item_ids(draft)
-    availability_map = fetch_inventory_availability(inventory_item_ids)
+def line_inventory_review_label(line: dict, inventory_item: Optional[dict] = None) -> str:
+    if inventory_item:
+        return (
+            inventory_item.get("sku")
+            or line.get("sku")
+            or (line.get("variant") or {}).get("displayName")
+            or line.get("title")
+            or "(no sku)"
+        )
+    return line.get("sku") or line.get("title") or "(no sku)"
+
+
+def inventory_requirement_lines(draft: dict) -> Tuple[List[dict], List[str]]:
+    """
+    Returns tracked inventory lines that must be allocated, plus hard-stop
+    reasons for anything inventory-related that cannot be safely verified.
+    """
+    requirement_lines: List[dict] = []
+    hard_reasons: List[str] = []
 
     line_items = draft.get("lineItems") or {}
     edges = line_items.get("edges") or []
@@ -730,61 +776,175 @@ def inventory_threshold_review_reasons(draft: dict) -> List[str]:
     for edge in edges:
         line = edge.get("node") or {}
         title = (line.get("title") or "unknown").strip()
+        quantity = int(line.get("quantity") or 0)
         variant = line.get("variant")
 
-        # FIX: Custom lines (no variant) cannot have inventory verified.
-        # Flag for review instead of silently assuming inventory is available.
+        if quantity <= 0:
+            continue
+
+        # Custom lines cannot be verified against Shopify inventory.
         if not variant:
-            reasons.append(
+            hard_reasons.append(
                 f"Custom line item with no variant — cannot verify inventory: {title}"
             )
             continue
 
         inventory_item = variant.get("inventoryItem")
         if not inventory_item:
-            reasons.append(
+            hard_reasons.append(
                 f"Variant has no inventory item: {variant.get('displayName', title)}"
             )
             continue
 
         tracked = bool(inventory_item.get("tracked"))
-        sku = (
-            inventory_item.get("sku")
-            or line.get("sku")
-            or variant.get("displayName")
-            or title
-            or "(no sku)"
-        )
+        sku = line_inventory_review_label(line, inventory_item)
         inventory_item_id = inventory_item.get("id")
 
         if not tracked:
-            logger.info("Draft %s | inventory threshold check ignoring untracked item: %s", draft.get("name"), sku)
+            logger.info("Draft %s | inventory check ignoring untracked item: %s", draft.get("name"), sku)
             continue
 
         if not inventory_item_id:
-            reasons.append(f"Missing inventory item ID for {sku}")
+            hard_reasons.append(f"Missing inventory item ID for {sku}")
             continue
 
-        availability_info = availability_map.get(inventory_item_id)
-        if not availability_info:
-            logger.info("Draft %s | inventory threshold check ignoring item with no availability data: %s", draft.get("name"), sku)
-            continue
+        requirement_lines.append(
+            {
+                "inventory_item_id": inventory_item_id,
+                "sku": sku,
+                "title": title,
+                "quantity": quantity,
+            }
+        )
 
-        available = availability_info.get("available")
+    return requirement_lines, hard_reasons
+
+
+def ensure_inventory_pool_entries(inventory_item_ids: List[str], inventory_pool: InventoryPool) -> None:
+    missing_ids = [item_id for item_id in inventory_item_ids if item_id not in inventory_pool]
+    if not missing_ids:
+        return
+
+    availability_map = fetch_inventory_availability(missing_ids)
+    for inventory_item_id in missing_ids:
+        info = availability_map.get(inventory_item_id)
+        if info:
+            inventory_pool[inventory_item_id] = {
+                "sku": info.get("sku") or "(no sku)",
+                "available": info.get("available"),
+            }
+        else:
+            inventory_pool[inventory_item_id] = {
+                "sku": "(unknown sku)",
+                "available": None,
+            }
+
+
+def inventory_allocation_review_reasons(
+    draft: dict,
+    inventory_pool: InventoryPool,
+) -> Tuple[List[str], List[str]]:
+    """
+    Returns (hard_stop_reasons, low_supply_reasons).
+
+    Hard stop means the draft cannot be safely pushed because ordered quantity
+    exceeds remaining available inventory, or inventory cannot be verified.
+
+    Low supply means the draft can be filled from current remaining available
+    inventory, but doing so would leave less than INVENTORY_REVIEW_THRESHOLD.
+    """
+    requirement_lines, hard_reasons = inventory_requirement_lines(draft)
+
+    inventory_item_ids = sorted({line["inventory_item_id"] for line in requirement_lines})
+    ensure_inventory_pool_entries(inventory_item_ids, inventory_pool)
+
+    low_supply_reasons: List[str] = []
+
+    # Aggregate duplicate SKU / inventory item quantities on the same draft.
+    aggregated: Dict[str, dict] = {}
+    for line in requirement_lines:
+        inventory_item_id = line["inventory_item_id"]
+        if inventory_item_id not in aggregated:
+            aggregated[inventory_item_id] = {
+                "sku": line["sku"],
+                "quantity": 0,
+            }
+        aggregated[inventory_item_id]["quantity"] += int(line["quantity"] or 0)
+
+    for inventory_item_id, requirement in aggregated.items():
+        sku = requirement["sku"]
+        ordered_quantity = int(requirement["quantity"] or 0)
+        pool_info = inventory_pool.get(inventory_item_id) or {}
+        available = pool_info.get("available")
 
         if available is None:
-            reasons.append(
+            hard_reasons.append(
                 f"No inventory record found at configured location {SHOPIFY_LOCATION_ID} for {sku}"
             )
             continue
 
-        if available < INVENTORY_REVIEW_THRESHOLD:
-            reasons.append(
-                f"Available inventory below {INVENTORY_REVIEW_THRESHOLD} for {sku}: available {available}"
+        available = int(available)
+
+        if available < ordered_quantity:
+            hard_reasons.append(
+                f"Insufficient inventory for {sku}: ordered {ordered_quantity}, available {available}, shortage {ordered_quantity - available}"
+            )
+            continue
+
+        remaining_after_order = available - ordered_quantity
+        if remaining_after_order < INVENTORY_REVIEW_THRESHOLD:
+            low_supply_reasons.append(
+                f"Low remaining inventory after this order for {sku}: ordered {ordered_quantity}, available {available}, remaining {remaining_after_order}, threshold {INVENTORY_REVIEW_THRESHOLD}"
             )
 
-    return reasons
+    return hard_reasons, low_supply_reasons
 
+
+def reserve_inventory_for_draft(draft: dict, inventory_pool: InventoryPool) -> None:
+    """
+    Reserve inventory in memory after a draft passes inventory checks. This is
+    the guardrail that prevents two drafts in the same run from both consuming
+    the same available units.
+    """
+    requirement_lines, hard_reasons = inventory_requirement_lines(draft)
+    if hard_reasons:
+        raise RuntimeError(
+            "Cannot reserve inventory because the draft has unverifiable inventory lines: "
+            + "; ".join(hard_reasons)
+        )
+
+    inventory_item_ids = sorted({line["inventory_item_id"] for line in requirement_lines})
+    ensure_inventory_pool_entries(inventory_item_ids, inventory_pool)
+
+    aggregated: Dict[str, dict] = {}
+    for line in requirement_lines:
+        inventory_item_id = line["inventory_item_id"]
+        if inventory_item_id not in aggregated:
+            aggregated[inventory_item_id] = {
+                "sku": line["sku"],
+                "quantity": 0,
+            }
+        aggregated[inventory_item_id]["quantity"] += int(line["quantity"] or 0)
+
+    for inventory_item_id, requirement in aggregated.items():
+        sku = requirement["sku"]
+        quantity = int(requirement["quantity"] or 0)
+        pool_info = inventory_pool.get(inventory_item_id) or {}
+        available = pool_info.get("available")
+
+        if available is None or int(available) < quantity:
+            raise RuntimeError(
+                f"Cannot reserve inventory for {sku}: ordered {quantity}, remaining available {available}"
+            )
+
+        inventory_pool[inventory_item_id]["available"] = int(available) - quantity
+        logger.info(
+            "Draft %s | reserved %s unit(s) of %s in run inventory pool; remaining pool quantity %s",
+            draft.get("name"),
+            quantity,
+            sku,
+            inventory_pool[inventory_item_id]["available"],
+        )
 
 def ensure_csv_exists() -> None:
     path = Path(CSV_LOG_PATH)
@@ -951,6 +1111,42 @@ def update_order_tags(order_id: str, final_tags: List[str]) -> dict:
     return data["orderUpdate"]["order"]
 
 
+def set_draft_inventory_review_metafield(draft_id: str, value: str) -> dict:
+    """
+    Stores human-readable inventory review details directly on the draft order.
+    Create a Shopify draft order metafield definition with:
+      namespace: b2b
+      key: inventory_review_reason
+      type: Multi-line text
+    or override these with INVENTORY_REVIEW_NAMESPACE / KEY / TYPE.
+    """
+    value = (value or "").strip()
+    if not value:
+        return {}
+
+    metafield_payload = {
+        "ownerId": draft_id,
+        "namespace": INVENTORY_REVIEW_NAMESPACE,
+        "key": INVENTORY_REVIEW_KEY,
+        "type": INVENTORY_REVIEW_TYPE,
+        "value": value,
+    }
+
+    if DRY_RUN:
+        logger.info("DRY RUN | would set draft inventory review metafield on %s: %s", draft_id, metafield_payload)
+        return {}
+
+    data = shopify_graphql(
+        METAFIELDS_SET_MUTATION,
+        {"metafields": [metafield_payload]},
+    )
+    user_errors = data["metafieldsSet"].get("userErrors", [])
+    if user_errors:
+        raise RuntimeError(f"metafieldsSet userErrors: {user_errors}")
+    metafields = data["metafieldsSet"].get("metafields") or []
+    return metafields[0] if metafields else {}
+
+
 def complete_draft(draft_id: str, is_free: bool = False) -> dict:
     if DRY_RUN:
         logger.info("DRY RUN | would complete draft %s (is_free=%s)", draft_id, is_free)
@@ -1025,6 +1221,20 @@ def mark_needs_review(draft: dict, reason: Optional[str] = None) -> None:
         logger.warning("%s | marked %s | %s", draft.get("name"), NEEDS_REVIEW_TAG, reason)
 
 
+def mark_inventory_shortage(draft: dict, reason: Optional[str] = None) -> None:
+    current_tags = normalize_tags(draft.get("tags", []))
+    final_tags = add_tags(current_tags, NEEDS_REVIEW_TAG, INVENTORY_SHORTAGE_TAG)
+    final_tags = remove_tags(
+        final_tags,
+        PROCESSING_TAG,
+        SUBMITTED_TAG,
+    )
+    update_draft(draft["id"], {"tags": final_tags})
+    if reason:
+        set_draft_inventory_review_metafield(draft["id"], reason)
+        logger.warning("%s | marked %s/%s | %s", draft.get("name"), NEEDS_REVIEW_TAG, INVENTORY_SHORTAGE_TAG, reason)
+
+
 def mark_low_supply(draft: dict, reason: Optional[str] = None) -> None:
     current_tags = normalize_tags(draft.get("tags", []))
     final_tags = add_tags(current_tags, LOW_SUPPLY_TAG)
@@ -1035,6 +1245,7 @@ def mark_low_supply(draft: dict, reason: Optional[str] = None) -> None:
     )
     update_draft(draft["id"], {"tags": final_tags})
     if reason:
+        set_draft_inventory_review_metafield(draft["id"], reason)
         logger.warning("%s | marked %s | %s", draft.get("name"), LOW_SUPPLY_TAG, reason)
 
 
@@ -1071,7 +1282,7 @@ def finalize_completed_order_tags(
 ) -> dict:
     draft_tags_before_complete = normalize_tags(draft_before_complete.get("tags", []))
     final_order_tags = add_tags(
-        remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG, LOW_SUPPLY_TAG),
+        remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG, LOW_SUPPLY_TAG, INVENTORY_SHORTAGE_TAG),
         SUBMITTED_TAG,
     )
 
@@ -1491,7 +1702,7 @@ def ensure_payment_terms(draft: dict, now_dt: datetime) -> Tuple[bool, str, str,
     return True, f"Overrode payment terms to {detected_label} ({attempt_description})", detected_label, detected_days
 
 
-def process_draft(draft: dict, now_dt: datetime) -> None:
+def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) -> None:
     today = now_dt.date()
     name = draft["name"]
     draft_id = draft["id"]
@@ -1796,11 +2007,31 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         return
 
     latest = recheck_draft(draft_id)
-    inventory_review_reasons = inventory_threshold_review_reasons(latest)
+    inventory_hard_reasons, inventory_low_supply_reasons = inventory_allocation_review_reasons(latest, inventory_pool)
 
-    if inventory_review_reasons:
-        inventory_reason = "; ".join(inventory_review_reasons)
-        logger.info("%s | inventory-threshold-check=False | %s", name, inventory_reason)
+    if inventory_hard_reasons:
+        inventory_reason = "; ".join(inventory_hard_reasons)
+        logger.info("%s | inventory-allocation-check=False | %s", name, inventory_reason)
+
+        mark_inventory_shortage(latest, inventory_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="inventory-shortage",
+            success=False,
+            reason=inventory_reason,
+            detected_terms=detected_terms,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
+    if inventory_low_supply_reasons:
+        inventory_reason = "; ".join(inventory_low_supply_reasons)
+        logger.info("%s | inventory-low-supply-check=False | %s", name, inventory_reason)
 
         mark_low_supply(latest, inventory_reason)
         latest = recheck_draft(draft_id)
@@ -1819,12 +2050,13 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
         return
 
     logger.info(
-        "%s | inventory-threshold-check=True | all tracked items have at least %s available at target location",
+        "%s | inventory-allocation-check=True | all tracked items can be filled and remain at or above threshold %s after this draft",
         name,
         INVENTORY_REVIEW_THRESHOLD,
     )
 
     draft_state_before_complete = recheck_draft(draft_id)
+    reserve_inventory_for_draft(draft_state_before_complete, inventory_pool)
 
     if is_free_order:
         logger.info("%s | $0.00 order; using free-order completion mutation", name)
@@ -1896,10 +2128,11 @@ def process_draft(draft: dict, now_dt: datetime) -> None:
 def main() -> None:
     now_dt = datetime.now(timezone.utc)
     drafts = fetch_candidate_drafts()
+    inventory_pool: InventoryPool = {}
 
     for draft in drafts:
         try:
-            process_draft(draft, now_dt)
+            process_draft(draft, now_dt, inventory_pool)
         except Exception as exc:
             logger.exception("Failed processing %s: %s", draft.get("name"), exc)
             try:
