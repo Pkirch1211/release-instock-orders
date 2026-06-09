@@ -886,14 +886,14 @@ def inventory_allocation_review_reasons(
 
         if available < ordered_quantity:
             hard_reasons.append(
-                f"Insufficient inventory for {sku}: ordered {ordered_quantity}, available {available}, shortage {ordered_quantity - available}"
+                f"{sku}: ord {ordered_quantity} | avail {available} | short {ordered_quantity - available}"
             )
             continue
 
         remaining_after_order = available - ordered_quantity
         if remaining_after_order < INVENTORY_REVIEW_THRESHOLD:
             low_supply_reasons.append(
-                f"Low remaining inventory after this order for {sku}: ordered {ordered_quantity}, available {available}, remaining {remaining_after_order}, threshold {INVENTORY_REVIEW_THRESHOLD}"
+                f"{sku}: ord {ordered_quantity} | avail {available} | rem {remaining_after_order} | min {INVENTORY_REVIEW_THRESHOLD}"
             )
 
     return hard_reasons, low_supply_reasons
