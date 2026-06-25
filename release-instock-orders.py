@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import os
 import re
@@ -82,6 +83,11 @@ EXCLUDED_SKUS = {
     for sku in os.getenv("EXCLUDED_SKUS", "").split(",")
     if sku.strip()
 }
+
+# Where to write a JSON snapshot of EXCLUDED_SKUS (with product titles) for
+# the Ops Scorecard dashboard to read. Purely additive / side-channel —
+# never read back by this script, so it cannot affect order processing.
+EXCLUDED_SKUS_EXPORT_PATH = os.getenv("EXCLUDED_SKUS_EXPORT_PATH", "excluded_skus.json").strip()
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
@@ -374,6 +380,25 @@ query GetInventoryItems($ids: [ID!]!, $levelsPageSize: Int!) {
               quantity
             }
           }
+        }
+      }
+    }
+  }
+}
+"""
+
+# Used only by publish_excluded_skus_snapshot() to attach a human-readable
+# product title to each excluded SKU for the dashboard. Not used anywhere
+# in the order-processing flow.
+VARIANT_BY_SKU_QUERY = """
+query VariantBySku($query: String!) {
+  productVariants(first: 5, query: $query) {
+    edges {
+      node {
+        sku
+        displayName
+        product {
+          title
         }
       }
     }
@@ -1050,6 +1075,87 @@ def fetch_candidate_drafts() -> List[dict]:
     if EXCLUDED_SKUS:
         logger.info("EXCLUDED_SKUS active: %s", sorted(EXCLUDED_SKUS))
     return drafts
+
+
+def lookup_variant_titles_by_sku(skus: List[str]) -> Dict[str, str]:
+    """
+    Looks up a human-readable "Product Title - Variant" label for each SKU,
+    one Shopify query per SKU (the list is small and only runs once per
+    script execution, so this does not need batching).
+
+    Read-only — does not touch draft orders, inventory, or anything else
+    process_draft() depends on. A SKU that errors or has no match simply
+    falls back to the bare SKU string as its own label, so a single bad
+    lookup never breaks the snapshot for the rest of the list.
+    """
+    titles: Dict[str, str] = {}
+
+    for sku in sorted(skus):
+        try:
+            data = shopify_graphql(
+                VARIANT_BY_SKU_QUERY,
+                {"query": f"sku:{sku}"},
+            )
+            edges = (data.get("productVariants") or {}).get("edges") or []
+
+            match = None
+            for edge in edges:
+                node = edge.get("node") or {}
+                if (node.get("sku") or "").strip().upper() == sku.upper():
+                    match = node
+                    break
+
+            if match:
+                product_title = ((match.get("product") or {}).get("title") or "").strip()
+                variant_name = (match.get("displayName") or "").strip()
+                if product_title and variant_name and variant_name.upper() != "DEFAULT TITLE":
+                    titles[sku] = f"{product_title} - {variant_name}"
+                elif product_title:
+                    titles[sku] = product_title
+                else:
+                    titles[sku] = sku
+            else:
+                titles[sku] = sku
+                logger.warning("Excluded SKU snapshot: no product match found for %s", sku)
+        except Exception as exc:
+            titles[sku] = sku
+            logger.warning("Excluded SKU snapshot: lookup failed for %s: %s", sku, exc)
+
+    return titles
+
+
+def publish_excluded_skus_snapshot() -> None:
+    """
+    Writes a JSON snapshot of the current EXCLUDED_SKUS list, with product
+    titles attached, to EXCLUDED_SKUS_EXPORT_PATH for the Ops Scorecard
+    dashboard to read (e.g. via a committed file in CI).
+
+    This is purely additive reporting: it is read-only against Shopify,
+    never reads back its own output, and is wrapped in its own try/except
+    by the caller so a failure here can never affect order processing.
+    """
+    skus = sorted(EXCLUDED_SKUS)
+    titles = lookup_variant_titles_by_sku(skus) if skus else {}
+
+    snapshot = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(skus),
+        "skus": [
+            {"sku": sku, "title": titles.get(sku, sku)}
+            for sku in skus
+        ],
+    }
+
+    path = Path(EXCLUDED_SKUS_EXPORT_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2)
+
+    logger.info(
+        "Published excluded SKU snapshot to %s (%s SKU(s))",
+        EXCLUDED_SKUS_EXPORT_PATH,
+        len(skus),
+    )
 
 
 def recheck_draft(draft_id: str) -> dict:
@@ -2126,6 +2232,14 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
 
 def main() -> None:
     now_dt = datetime.now(timezone.utc)
+
+    # Side-channel reporting only — never allowed to block or fail the actual
+    # order-processing run below, regardless of what goes wrong here.
+    try:
+        publish_excluded_skus_snapshot()
+    except Exception:
+        logger.exception("Could not publish excluded SKU snapshot (non-fatal, continuing run)")
+
     drafts = fetch_candidate_drafts()
     inventory_pool: InventoryPool = {}
 
