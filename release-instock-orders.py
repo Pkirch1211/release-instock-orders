@@ -1106,14 +1106,14 @@ def lookup_variant_titles_by_sku(skus: List[str]) -> Dict[str, str]:
                     break
 
             if match:
+                # Shopify's variant displayName is already formatted as
+                # "Product Title - Variant Title" (or just "Product Title"
+                # for single-variant/Default Title products) — it does NOT
+                # need product.title concatenated in front of it. Doing so
+                # previously produced duplicated titles like "X - X - Default Title".
+                display_name = (match.get("displayName") or "").strip()
                 product_title = ((match.get("product") or {}).get("title") or "").strip()
-                variant_name = (match.get("displayName") or "").strip()
-                if product_title and variant_name and variant_name.upper() != "DEFAULT TITLE":
-                    titles[sku] = f"{product_title} - {variant_name}"
-                elif product_title:
-                    titles[sku] = product_title
-                else:
-                    titles[sku] = sku
+                titles[sku] = display_name or product_title or sku
             else:
                 titles[sku] = sku
                 logger.warning("Excluded SKU snapshot: no product match found for %s", sku)
