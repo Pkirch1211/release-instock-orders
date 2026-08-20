@@ -103,7 +103,7 @@ InventoryPool = Dict[str, Dict[str, Optional[int]]]
 
 CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "release_instock_orders_log.csv").strip()
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
-DEFAULT_FREIGHT_TITLE = os.getenv("DEFAULT_FREIGHT_TITLE", "UPS Ground").strip() or "UPS Ground"
+DEFAULT_FREIGHT_TITLE = os.getenv("DEFAULT_FREIGHT_TITLE", "UPS Ground Prepaid").strip() or "UPS Ground Prepaid"
 
 DEFAULT_PAYMENT_TERMS_TEMPLATE_ID = os.getenv(
     "DEFAULT_PAYMENT_TERMS_TEMPLATE_ID",
