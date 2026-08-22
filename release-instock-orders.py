@@ -1498,11 +1498,11 @@ def detect_net_terms_days(text: str) -> Optional[int]:
 
     haystack = text.upper()
     patterns = {
-        120: [r"\bNET[\s\-_\/:]*120\b", r"\bN[\s\-_\/:]*120\b"],
-        90: [r"\bNET[\s\-_\/:]*90\b", r"\bN[\s\-_\/:]*90\b"],
-        60: [r"\bNET[\s\-_\/:]*60\b", r"\bN[\s\-_\/:]*60\b"],
-        45: [r"\bNET[\s\-_\/:]*45\b", r"\bN[\s\-_\/:]*45\b"],
-        30: [r"\bNET[\s\-_\/:]*30\b", r"\bN[\s\-_\/:]*30\b"],
+        120: [r"\bNET[\s\-_\/:]*120\b", r"\bN[\s\-_\/:]*120\b", r"\bTERMS?[\s\-_\/:]*120\b"],
+        90: [r"\bNET[\s\-_\/:]*90\b", r"\bN[\s\-_\/:]*90\b", r"\bTERMS?[\s\-_\/:]*90\b"],
+        60: [r"\bNET[\s\-_\/:]*60\b", r"\bN[\s\-_\/:]*60\b", r"\bTERMS?[\s\-_\/:]*60\b"],
+        45: [r"\bNET[\s\-_\/:]*45\b", r"\bN[\s\-_\/:]*45\b", r"\bTERMS?[\s\-_\/:]*45\b"],
+        30: [r"\bNET[\s\-_\/:]*30\b", r"\bN[\s\-_\/:]*30\b", r"\bTERMS?[\s\-_\/:]*30\b"],
     }
     for days, regexes in patterns.items():
         for pattern in regexes:
