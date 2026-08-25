@@ -1566,7 +1566,11 @@ def build_freight_quote(draft: dict) -> Tuple[bool, str, str, str]:
     blob = build_note_blob(draft)
 
     if valid_free_freight_marker_present(blob):
-        return True, "free-freight", "", ""
+        # Still default to the standard freight title, just at $0.00 —
+        # previously this returned a blank title/price and left shipping
+        # untouched downstream, which is why free-freight drafts were
+        # showing blank shipping instead of "UPS Ground Prepaid".
+        return True, "free-freight", DEFAULT_FREIGHT_TITLE, "0.00"
 
     subtotal = draft_subtotal_amount(draft)
     if subtotal is None:
@@ -1601,13 +1605,13 @@ def ensure_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]:
     if not ok:
         return False, freight_action, freight_title, freight_price, freight_action
 
-    if freight_action == "free-freight":
-        return True, freight_action, freight_title, freight_price, "Valid free-freight marker found; leaving shipping unchanged"
-
     if shipping_line_matches(draft, freight_title, freight_price):
-        return True, freight_action, freight_title, freight_price, (
-            f"Existing shipping already matches {freight_title} at {freight_price}"
+        reason = (
+            f"Valid free-freight marker found; shipping already matches {freight_title} at {freight_price}"
+            if freight_action == "free-freight"
+            else f"Existing shipping already matches {freight_title} at {freight_price}"
         )
+        return True, freight_action, freight_title, freight_price, reason
 
     currency_code = (draft.get("currencyCode") or "").strip() or "USD"
     shipping_payload = {
@@ -1628,9 +1632,13 @@ def ensure_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]:
         currency_code,
     )
     update_draft(draft["id"], shipping_payload)
-    return True, freight_action, freight_title, freight_price, (
-        f"Set shipping to {freight_title} at {freight_price} {currency_code}"
+
+    reason = (
+        f"Valid free-freight marker found; set shipping to {freight_title} at {freight_price} {currency_code}"
+        if freight_action == "free-freight"
+        else f"Set shipping to {freight_title} at {freight_price} {currency_code}"
     )
+    return True, freight_action, freight_title, freight_price, reason
 
 
 def build_issued_at(now_dt: datetime) -> str:
@@ -2010,14 +2018,14 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
         )
         return
 
-    if not DRY_RUN and freight_action == "charge-freight":
+    if not DRY_RUN and freight_action in ("charge-freight", "free-freight"):
         if not shipping_line_matches(latest, freight_title, freight_price):
             freight_ok = False
             freight_reason = (
                 f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
                 f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}'"
             )
-    elif DRY_RUN and freight_action == "charge-freight":
+    elif DRY_RUN and freight_action in ("charge-freight", "free-freight"):
         logger.info(
             "%s | DRY RUN active; shipping remains unchanged on recheck because no mutation was sent",
             name,
