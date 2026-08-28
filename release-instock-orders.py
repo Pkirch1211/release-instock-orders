@@ -29,6 +29,7 @@ SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
 NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
 LOW_SUPPLY_TAG = os.getenv("LOW_SUPPLY_TAG", "low-supply").strip()
 INVENTORY_SHORTAGE_TAG = os.getenv("INVENTORY_SHORTAGE_TAG", "inventory-shortage").strip()
+BELOW_MIN_VALUE_TAG = os.getenv("BELOW_MIN_VALUE_TAG", "below-min-value").strip()
 
 INVENTORY_REVIEW_NAMESPACE = os.getenv("INVENTORY_REVIEW_NAMESPACE", "b2b").strip()
 INVENTORY_REVIEW_KEY = os.getenv("INVENTORY_REVIEW_KEY", "inventory_review_reason").strip()
@@ -76,6 +77,18 @@ EXCLUDED_CUSTOMER_SUBSTRINGS = {
     c.strip().upper()
     for c in os.getenv("EXCLUDED_CUSTOMER_SUBSTRINGS", "").split(",")
     if c.strip()
+}
+
+# No draft under this subtotal may be released, unless the draft's contact
+# email domain is in MIN_VALUE_EXEMPT_EMAIL_DOMAINS (internal accounts like
+# Customer Care, Customer Samples, and Rep Groups, which all use
+# @lifelines.com addresses in Shopify regardless of company name).
+MIN_ORDER_VALUE = Decimal(os.getenv("MIN_ORDER_VALUE", "75").strip())
+
+MIN_VALUE_EXEMPT_EMAIL_DOMAINS = {
+    d.strip().lower().lstrip("@")
+    for d in os.getenv("MIN_VALUE_EXEMPT_EMAIL_DOMAINS", "lifelines.com").split(",")
+    if d.strip()
 }
 
 EXCLUDED_SKUS = {
@@ -190,6 +203,7 @@ query CandidateDrafts(
         poNumber
         updatedAt
         currencyCode
+        email
         subtotalPriceSet {
           shopMoney {
             amount
@@ -281,6 +295,7 @@ query RecheckDraft(
     note2
     poNumber
     currencyCode
+    email
     subtotalPriceSet {
       shopMoney {
         amount
@@ -627,6 +642,32 @@ def should_exclude_customer(draft: dict) -> bool:
         return any(fragment in customer_name for fragment in EXCLUDED_CUSTOMER_SUBSTRINGS)
 
     return False
+
+
+def is_min_value_exempt(draft: dict) -> bool:
+    email = (draft.get("email") or "").strip().lower()
+    if "@" not in email:
+        return False
+    domain = email.rsplit("@", 1)[-1]
+    return domain in MIN_VALUE_EXEMPT_EMAIL_DOMAINS
+
+
+def below_min_value_reason(draft: dict) -> Optional[str]:
+    """
+    Returns a reason string if this draft's subtotal is below MIN_ORDER_VALUE
+    and it is not exempt by contact email domain, otherwise None.
+    """
+    if is_min_value_exempt(draft):
+        return None
+
+    subtotal = draft_subtotal_amount(draft)
+    if subtotal is None:
+        return None
+
+    if subtotal < MIN_ORDER_VALUE:
+        return f"Subtotal {money_to_str(subtotal)} is below MIN_ORDER_VALUE {money_to_str(MIN_ORDER_VALUE)}"
+
+    return None
 
 
 def draft_line_item_skus(draft: dict) -> List[str]:
@@ -1356,6 +1397,19 @@ def mark_low_supply(draft: dict, reason: Optional[str] = None) -> None:
         logger.warning("%s | marked %s | %s", draft.get("name"), LOW_SUPPLY_TAG, reason)
 
 
+def mark_below_min_value(draft: dict, reason: Optional[str] = None) -> None:
+    current_tags = normalize_tags(draft.get("tags", []))
+    final_tags = add_tags(current_tags, BELOW_MIN_VALUE_TAG)
+    final_tags = remove_tags(
+        final_tags,
+        PROCESSING_TAG,
+        SUBMITTED_TAG,
+    )
+    update_draft(draft["id"], {"tags": final_tags})
+    if reason:
+        logger.warning("%s | marked %s | %s", draft.get("name"), BELOW_MIN_VALUE_TAG, reason)
+
+
 def validate_completion_result(
     *,
     name: str,
@@ -1851,6 +1905,21 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
         )
         return
 
+    min_value_reason = below_min_value_reason(draft)
+    if min_value_reason:
+        logger.info("%s | min-value-check=False | %s", name, min_value_reason)
+        mark_below_min_value(draft, min_value_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="below-min-value",
+            success=False,
+            reason=min_value_reason,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+        )
+        return
+
     logger.info("-----")
     logger.info("Evaluating %s", name)
 
@@ -1964,6 +2033,21 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
             action="skipped",
             success=False,
             reason=f"Excluded SKU(s): {', '.join(excluded_skus)}",
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+        )
+        return
+
+    min_value_reason = below_min_value_reason(latest)
+    if min_value_reason:
+        logger.info("%s | min-value-check=False | %s", name, min_value_reason)
+        mark_below_min_value(latest, min_value_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="below-min-value",
+            success=False,
+            reason=min_value_reason,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
         )
