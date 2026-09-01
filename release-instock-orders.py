@@ -91,6 +91,24 @@ MIN_VALUE_EXEMPT_EMAIL_DOMAINS = {
     if d.strip()
 }
 
+# Belt-and-suspenders: the draft's own `email` field is often the end
+# customer's address (e.g. Customer Care placing an order on a customer's
+# behalf), so email-domain matching alone can't be relied on for internal
+# accounts. Company/customer name is stable regardless of whose email is on
+# any given order, so it's checked too — either one being true is enough
+# to exempt a draft from MIN_ORDER_VALUE.
+MIN_VALUE_EXEMPT_CUSTOMERS = {
+    c.strip().upper()
+    for c in os.getenv("MIN_VALUE_EXEMPT_CUSTOMERS", "").split(",")
+    if c.strip()
+}
+
+MIN_VALUE_EXEMPT_CUSTOMER_SUBSTRINGS = {
+    c.strip().upper()
+    for c in os.getenv("MIN_VALUE_EXEMPT_CUSTOMER_SUBSTRINGS", "").split(",")
+    if c.strip()
+}
+
 EXCLUDED_SKUS = {
     sku.strip().upper()
     for sku in os.getenv("EXCLUDED_SKUS", "").split(",")
@@ -644,12 +662,30 @@ def should_exclude_customer(draft: dict) -> bool:
     return False
 
 
-def is_min_value_exempt(draft: dict) -> bool:
+def is_min_value_exempt_by_email(draft: dict) -> bool:
     email = (draft.get("email") or "").strip().lower()
     if "@" not in email:
         return False
     domain = email.rsplit("@", 1)[-1]
     return domain in MIN_VALUE_EXEMPT_EMAIL_DOMAINS
+
+
+def is_min_value_exempt_by_customer(draft: dict) -> bool:
+    if not MIN_VALUE_EXEMPT_CUSTOMERS and not MIN_VALUE_EXEMPT_CUSTOMER_SUBSTRINGS:
+        return False
+
+    customer_name = safe_company_name(draft).strip().upper()
+    if not customer_name:
+        return False
+
+    if customer_name in MIN_VALUE_EXEMPT_CUSTOMERS:
+        return True
+
+    return any(fragment in customer_name for fragment in MIN_VALUE_EXEMPT_CUSTOMER_SUBSTRINGS)
+
+
+def is_min_value_exempt(draft: dict) -> bool:
+    return is_min_value_exempt_by_email(draft) or is_min_value_exempt_by_customer(draft)
 
 
 def below_min_value_reason(draft: dict) -> Optional[str]:
@@ -665,7 +701,12 @@ def below_min_value_reason(draft: dict) -> Optional[str]:
         return None
 
     if subtotal < MIN_ORDER_VALUE:
-        return f"Subtotal {money_to_str(subtotal)} is below MIN_ORDER_VALUE {money_to_str(MIN_ORDER_VALUE)}"
+        observed_email = (draft.get("email") or "").strip() or "(no email)"
+        observed_company = safe_company_name(draft).strip() or "(no company)"
+        return (
+            f"Subtotal {money_to_str(subtotal)} is below MIN_ORDER_VALUE {money_to_str(MIN_ORDER_VALUE)} "
+            f"(email={observed_email}, company={observed_company})"
+        )
 
     return None
 
