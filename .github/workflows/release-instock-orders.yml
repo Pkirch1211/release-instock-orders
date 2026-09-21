@@ -2,7 +2,10 @@ name: Release In-Stock Draft Orders
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 12-21 * * 1-5"
+    - cron: "17 12-21 * * 1-5"
+concurrency:
+  group: release-instock-orders
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
