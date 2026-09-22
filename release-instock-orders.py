@@ -1632,6 +1632,7 @@ def valid_free_freight_marker_present(text: str) -> bool:
     patterns = [
         r"\bFF\b",
         r"\bFFA\b",
+        r"\bFFF\b",
         r"\bF\s*/\s*F\b",
         r"\bFREE\s+FREIGHT\b",
         r"\bFREIGHT\s+FREE\b",
