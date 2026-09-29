@@ -48,6 +48,40 @@ EXCLUDE_TAGS = {
 }
 EXCLUDE_TAGS.add(NEEDS_REVIEW_TAG)
 
+# Split-pipeline locks (2026-09-29). A draft wearing either of these is
+# mid-split in shopify-adjust-orders-v2.py or partial-instock-split-v2.py
+# (or is an orphan duplicate left by an interrupted split) and must never
+# be completed here -- added unconditionally so an EXCLUDE_TAGS repo
+# variable can't accidentally drop them.
+SPLIT_PIPELINE_LOCK_TAGS = {
+    t for t in (
+        os.getenv("V2_PROCESSING_TAG", "v2-processing").strip(),
+        os.getenv("BO_PROCESSING_TAG", "bo-split-processing").strip(),
+    ) if t
+}
+EXCLUDE_TAGS.update(SPLIT_PIPELINE_LOCK_TAGS)
+
+# Pipeline-internal draft-state tags stripped from the ORDER at completion
+# (2026-09-29), so no completed order carries split0/split1/split2/...,
+# band tags, eval/minvalue markers, or draft-only release flags. Identity
+# tags (markettime, mt_recordID:*, mt_repGroupID:*, ...) are deliberately
+# NOT stripped: mt_recordID is the lineage/de-dupe key on orders.
+ORDER_STRIP_TAGS = {
+    t.strip()
+    for t in os.getenv(
+        "ORDER_STRIP_TAGS",
+        "split-150,split-remainder,eval-done,instock-minvalue,BO-minvalue,order-minvalue,"
+        "split-backorder-child,v2-processing,bo-split-processing",
+    ).split(",")
+    if t.strip()
+}
+ORDER_STRIP_TAGS.update({READY_TAG, BELOW_MIN_VALUE_TAG})
+ORDER_STRIP_TAG_RE = re.compile(r"^split\d+$", re.IGNORECASE)  # split0, split1, split2, ...
+
+# Lineage key stamped on every MT-imported draft and inherited by every
+# backorder child. Used by the pre-completion duplicate-PO guard.
+MT_RECORD_TAG_PREFIX = "mt_recordID:"
+
 
 COMPLETE_DRAFT_NAMES = {
     name.strip().replace("#", "")
@@ -208,7 +242,7 @@ query CandidateDrafts(
   draftOrders(
     first: $pageSize,
     after: $cursor,
-    query: "status:open tag:instock-ready -tag:needs-review -tag:order-push-processing -tag:order-submitted"
+    query: "status:open tag:instock-ready -tag:needs-review -tag:order-push-processing -tag:order-submitted -tag:v2-processing -tag:bo-split-processing"
   ) {
     edges {
       cursor
@@ -390,6 +424,39 @@ query RecheckOrder($id: ID!) {
     displayFulfillmentStatus
     displayFinancialStatus
     tags
+  }
+}
+"""
+
+# Duplicate-PO guard (2026-09-29). Every draft in an MT lineage (root and
+# all BO children) shares one mt_recordID tag, and every member has a
+# unique PO (root, root - BO1, root - BO2, ...). So "another open draft or
+# live order in my lineage already has MY PO" means a duplicate exists.
+LINEAGE_DRAFTS_QUERY = """
+query LineageDrafts($query: String!) {
+  draftOrders(first: 250, query: $query) {
+    edges {
+      node {
+        id
+        name
+        poNumber
+      }
+    }
+  }
+}
+"""
+
+LINEAGE_ORDERS_QUERY = """
+query LineageOrders($query: String!) {
+  orders(first: 250, query: $query) {
+    edges {
+      node {
+        id
+        name
+        poNumber
+        cancelledAt
+      }
+    }
   }
 }
 """
@@ -1476,6 +1543,62 @@ def validate_completion_result(
     return order_id, order_name
 
 
+def is_pipeline_state_tag(tag: str) -> bool:
+    t = (tag or "").strip()
+    return t in ORDER_STRIP_TAGS or bool(ORDER_STRIP_TAG_RE.match(t))
+
+
+def strip_pipeline_state_tags(tags: List[str]) -> List[str]:
+    return [t for t in normalize_tags(tags) if not is_pipeline_state_tag(t)]
+
+
+def norm_po(po: Optional[str]) -> str:
+    return re.sub(r"[#\s]", "", str(po or "")).upper()
+
+
+def duplicate_po_reasons(draft: dict) -> List[str]:
+    """
+    Pre-completion duplicate guard (2026-09-29). Returns reasons if ANY other
+    open draft or non-cancelled order in this draft's MT lineage (shared
+    mt_recordID tag) already carries this draft's exact PO number. Within a
+    healthy lineage every PO is unique (root, root - BO1, root - BO2, ...),
+    so a match means an orphan duplicate from an interrupted split or a
+    re-import -- completing this draft would ship the same product twice.
+
+    Raises on lookup failure; the caller fails CLOSED (skip this run).
+    Drafts without an mt_recordID tag (e.g. rep-entered) can't be checked
+    by lineage and return [] -- the split scripts' own guards cover those.
+    """
+    own_po = norm_po(draft.get("poNumber"))
+    rec_tag = next(
+        (t for t in (draft.get("tags") or []) if str(t).startswith(MT_RECORD_TAG_PREFIX)),
+        None,
+    )
+    if not own_po or not rec_tag:
+        return []
+
+    tag_clause = f'tag:"{rec_tag}"'
+    reasons: List[str] = []
+
+    data = shopify_graphql(LINEAGE_DRAFTS_QUERY, {"query": f"status:open {tag_clause}"})
+    for edge in (data.get("draftOrders") or {}).get("edges") or []:
+        node = edge.get("node") or {}
+        if node.get("id") == draft.get("id"):
+            continue
+        if norm_po(node.get("poNumber")) == own_po:
+            reasons.append(f"Open draft {node.get('name')} already has PO {node.get('poNumber')}")
+
+    data = shopify_graphql(LINEAGE_ORDERS_QUERY, {"query": tag_clause})
+    for edge in (data.get("orders") or {}).get("edges") or []:
+        node = edge.get("node") or {}
+        if node.get("cancelledAt"):
+            continue
+        if norm_po(node.get("poNumber")) == own_po:
+            reasons.append(f"Order {node.get('name')} already exists with PO {node.get('poNumber')}")
+
+    return reasons
+
+
 def finalize_completed_order_tags(
     *,
     draft_before_complete: dict,
@@ -1483,8 +1606,13 @@ def finalize_completed_order_tags(
     order_name: str,
 ) -> dict:
     draft_tags_before_complete = normalize_tags(draft_before_complete.get("tags", []))
+    # Strip pipeline-state tags (split0/split1/..., bands, eval/minvalue,
+    # instock-ready, locks) so the ORDER only carries identity tags plus
+    # SUBMITTED_TAG. See ORDER_STRIP_TAGS.
     final_order_tags = add_tags(
-        remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG, LOW_SUPPLY_TAG, INVENTORY_SHORTAGE_TAG),
+        strip_pipeline_state_tags(
+            remove_tags(draft_tags_before_complete, PROCESSING_TAG, NEEDS_REVIEW_TAG, LOW_SUPPLY_TAG, INVENTORY_SHORTAGE_TAG)
+        ),
         SUBMITTED_TAG,
     )
 
@@ -1505,6 +1633,15 @@ def finalize_completed_order_tags(
     if SUBMITTED_TAG not in latest_order_tags:
         raise RuntimeError(
             f"{order_name or order_id} completed but {SUBMITTED_TAG} is missing on order after tag update"
+        )
+    leftover_pipeline_tags = [t for t in latest_order_tags if is_pipeline_state_tag(t)]
+    if leftover_pipeline_tags:
+        # Not fatal: the order is already completed and valid. Logged loudly
+        # so it shows up in the run log / nightly audit.
+        logger.warning(
+            "%s | pipeline tags still present on order after cleanup: %s",
+            order_name or order_id,
+            ", ".join(leftover_pipeline_tags),
         )
 
     try:
@@ -2297,6 +2434,50 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
     )
 
     draft_state_before_complete = recheck_draft(draft_id)
+
+    # --- Duplicate-PO guard (2026-09-29): last check before an order is
+    # created. Fails CLOSED: a lookup error skips this draft for this run
+    # (claim released, retried next run); a real match escalates to review.
+    try:
+        dup_reasons = duplicate_po_reasons(draft_state_before_complete)
+    except Exception as exc:
+        logger.warning("%s | duplicate-po-check could not run (%s); skipping this run", name, exc)
+        release_claim(draft_state_before_complete)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="skipped",
+            success=False,
+            reason=f"Duplicate-PO check failed to run: {exc}",
+            detected_terms=detected_terms,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
+    if dup_reasons:
+        dup_reason = "Possible duplicate order: " + "; ".join(dup_reasons)
+        logger.warning("%s | duplicate-po-check=False | %s", name, dup_reason)
+        mark_needs_review(draft_state_before_complete, dup_reason)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="duplicate-po",
+            success=False,
+            reason=dup_reason,
+            detected_terms=detected_terms,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
+
+    logger.info("%s | duplicate-po-check=True", name)
     reserve_inventory_for_draft(draft_state_before_complete, inventory_pool)
 
     if is_free_order:
