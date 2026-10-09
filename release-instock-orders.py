@@ -149,6 +149,12 @@ EXCLUDED_SKUS = {
     if sku.strip()
 }
 
+# Launch-tag embargo (2026-10-09). Any draft with a line whose PRODUCT
+# carries a tag starting with this prefix is never released. Same prefix
+# and casefold-startswith match as shopify-adjust-orders-v2.py /
+# partial-instock-split-2.py, same env var name.
+LAUNCH_TAG_PREFIX = (os.getenv("LAUNCH_TAG_PREFIX", "launch-").strip() or "launch-").casefold()
+
 # Where to write a JSON snapshot of EXCLUDED_SKUS (with product titles) for
 # the Ops Scorecard dashboard to read. Purely additive / side-channel —
 # never read back by this script, so it cannot affect order processing.
@@ -282,6 +288,9 @@ query CandidateDrafts(
               variant {
                 id
                 displayName
+                product {
+                  tags
+                }
                 inventoryItem {
                   id
                   tracked
@@ -374,6 +383,9 @@ query RecheckDraft(
           variant {
             id
             displayName
+            product {
+              tags
+            }
             inventoryItem {
               id
               tracked
@@ -819,6 +831,54 @@ def excluded_skus_on_draft(draft: dict) -> List[str]:
 
 def should_exclude_sku(draft: dict) -> bool:
     return bool(excluded_skus_on_draft(draft))
+
+
+def launch_tagged_lines(draft: dict) -> List[str]:
+    """
+    Launch-tag embargo (2026-10-09). Returns one human-readable entry per
+    line item whose product carries a tag starting with LAUNCH_TAG_PREFIX
+    (casefold startswith, matching has_launch_tag() in the split scripts).
+    Untracked items are NOT exempt -- embargo is checked on every line.
+    """
+    line_items = draft.get("lineItems") or {}
+    edges = line_items.get("edges") or []
+
+    hits: List[str] = []
+    for edge in edges:
+        line = edge.get("node") or {}
+        variant = line.get("variant") or {}
+        product_tags = (variant.get("product") or {}).get("tags") or []
+        matched = sorted(
+            {str(t).strip() for t in product_tags if str(t).strip().casefold().startswith(LAUNCH_TAG_PREFIX)}
+        )
+        if not matched:
+            continue
+
+        inventory_item = variant.get("inventoryItem") or {}
+        sku = line_inventory_review_label(line, inventory_item or None)
+        hits.append(f"{sku}: launch embargo ({', '.join(matched)})")
+
+    return hits
+
+
+def launch_hold_reason(draft: dict) -> Optional[str]:
+    hits = launch_tagged_lines(draft)
+    if not hits:
+        return None
+    return "Launch-tag hold -- cannot release until launch tag is removed: " + "; ".join(hits)
+
+
+def hold_for_launch_tag(draft: dict, reason: str, *, claimed: bool) -> None:
+    """
+    Holds a draft for a launch-tag embargo: drops our processing claim (if
+    taken) and writes the reason to the inventory review metafield. Adds no
+    blocking tag, so the draft is re-evaluated every run and releases on its
+    own once the launch tag comes off the product.
+    """
+    if claimed:
+        release_claim(draft)
+    set_draft_inventory_review_metafield(draft["id"], reason)
+    logger.warning("%s | launch-tag-check=False | %s", draft.get("name"), reason)
 
 
 def draft_inventory_item_ids(draft: dict) -> List[str]:
@@ -2084,6 +2144,18 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
         )
         return
 
+    launch_reason = launch_hold_reason(draft)
+    if launch_reason:
+        hold_for_launch_tag(draft, launch_reason, claimed=False)
+        log_draft_result(
+            draft,
+            action="launch-hold",
+            success=False,
+            reason=launch_reason,
+            existing_terms_before=existing_terms_before,
+        )
+        return
+
     min_value_reason = below_min_value_reason(draft)
     if min_value_reason:
         logger.info("%s | min-value-check=False | %s", name, min_value_reason)
@@ -2212,6 +2284,20 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
             action="skipped",
             success=False,
             reason=f"Excluded SKU(s): {', '.join(excluded_skus)}",
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+        )
+        return
+
+    launch_reason = launch_hold_reason(latest)
+    if launch_reason:
+        hold_for_launch_tag(latest, launch_reason, claimed=True)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="launch-hold",
+            success=False,
+            reason=launch_reason,
             existing_terms_before=existing_terms_before,
             payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
         )
@@ -2434,6 +2520,25 @@ def process_draft(draft: dict, now_dt: datetime, inventory_pool: InventoryPool) 
     )
 
     draft_state_before_complete = recheck_draft(draft_id)
+
+    # --- Launch-tag embargo, final check on the exact state being completed.
+    launch_reason = launch_hold_reason(draft_state_before_complete)
+    if launch_reason:
+        hold_for_launch_tag(draft_state_before_complete, launch_reason, claimed=True)
+        latest = recheck_draft(draft_id)
+        log_draft_result(
+            latest,
+            action="launch-hold",
+            success=False,
+            reason=launch_reason,
+            detected_terms=detected_terms,
+            existing_terms_before=existing_terms_before,
+            payment_terms_after=payment_terms_name(latest.get("paymentTerms")),
+            freight_action=freight_action,
+            freight_title=freight_title,
+            freight_price=freight_price,
+        )
+        return
 
     # --- Duplicate-PO guard (2026-09-29): last check before an order is
     # created. Fails CLOSED: a lookup error skips this draft for this run
